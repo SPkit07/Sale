@@ -1,0 +1,804 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ตรวจสอบไฟล์ซ้ำ - Duplicate File Checker</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        
+        .container {
+            max-width: 1000px;
+        }
+        
+        .card {
+            border: none;
+            border-radius: 10px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+        }
+        
+        .card-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 10px 10px 0 0 !important;
+            padding: 20px;
+        }
+        
+        .card-title {
+            margin: 0;
+            font-size: 24px;
+            font-weight: bold;
+        }
+        
+        .upload-area {
+            border: 2px dashed #667eea;
+            border-radius: 8px;
+            padding: 40px;
+            text-align: center;
+            background: #f8f9ff;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .upload-area:hover {
+            background: #f0f1ff;
+            border-color: #764ba2;
+        }
+        
+        .upload-area.dragover {
+            background: #e8ebff;
+            border-color: #764ba2;
+            box-shadow: 0 0 10px rgba(102, 126, 234, 0.3);
+        }
+        
+        .btn-upload {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border: none;
+            color: white;
+            padding: 10px 30px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: transform 0.2s;
+        }
+        
+        .btn-upload:hover {
+            transform: scale(1.05);
+            color: white;
+        }
+        
+        .file-input {
+            display: none;
+        }
+        
+        .file-list {
+            margin-top: 15px;
+        }
+        
+        .file-item {
+            background: white;
+            padding: 10px 15px;
+            margin: 5px 0;
+            border-radius: 5px;
+            border-left: 4px solid #667eea;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .file-item .remove-btn {
+            background: #dc3545;
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        
+        .file-item .remove-btn:hover {
+            background: #c82333;
+        }
+        
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+        
+        .modal-overlay.show {
+            display: flex;
+        }
+        
+        .modal-content {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+            max-width: 500px;
+            width: 90%;
+        }
+        
+        .modal-content h5 {
+            margin-bottom: 20px;
+            color: #667eea;
+        }
+        
+        .modal-content input {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            margin-bottom: 15px;
+            font-size: 14px;
+        }
+        
+        .modal-buttons {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+        
+        .modal-buttons button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        
+        .modal-buttons .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+        
+        .modal-buttons .btn-secondary {
+            background: #ddd;
+            color: #333;
+        }
+        
+        .results-section {
+            margin-top: 30px;
+            display: none;
+        }
+        
+        .results-section.show {
+            display: block;
+        }
+        
+        .alert-duplicate {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        
+        .alert-success-check {
+            background: #d4edda;
+            border-left: 4px solid #28a745;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        
+        .alert-danger-check {
+            background: #f8d7da;
+            border-left: 4px solid #dc3545;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        
+        .duplicate-group {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+            border-left: 4px solid #ffc107;
+        }
+        
+        .duplicate-group h6 {
+            color: #856404;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        
+        .duplicate-file {
+            background: white;
+            padding: 10px;
+            margin: 5px 0;
+            border-radius: 3px;
+            border-left: 3px solid #ffc107;
+        }
+        
+        .table-responsive {
+            border-radius: 5px;
+            overflow: hidden;
+        }
+        
+        table {
+            font-size: 14px;
+        }
+        
+        .badge {
+            padding: 5px 10px;
+            border-radius: 3px;
+        }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+        
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 10px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .info-stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .stat-box {
+            background: white;
+            padding: 15px;
+            border-radius: 5px;
+            text-align: center;
+            border-top: 3px solid #667eea;
+        }
+        
+        .stat-box .number {
+            font-size: 24px;
+            font-weight: bold;
+            color: #667eea;
+        }
+        
+        .stat-box .label {
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+        }
+        
+        @media (max-width: 768px) {
+            .info-stats {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            
+            .upload-area {
+                padding: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title">🔍 ตรวจสอบไฟล์ซ้ำ & วิเคราะห์ตำแหน่ง</h5>
+                <small>Duplicate File Checker & Location Analysis - อัพโหลดไฟล์เพื่อตรวจสอบไฟล์ที่เหมือนกันและวิเคราะห์ตำแหน่ง</small>
+            </div>
+            
+            <div class="card-body">
+                <!-- Mode Selection -->
+                <div style="margin-bottom: 20px; display: flex; gap: 10px; flex-wrap: wrap;">
+                    <button class="btn btn-primary" id="modeCheckDuplicates" onclick="setMode('duplicates')" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border: none;">
+                        🔍 ตรวจสอบไฟล์ซ้ำ
+                    </button>
+                    <button class="btn btn-secondary" id="modeAnalyzeLocation" onclick="setMode('location')" style="background: #ddd; color: #333;">
+                        📍 วิเคราะห์ตำแหน่ง
+                    </button>
+                </div>
+                
+                <hr>
+                
+                <!-- Upload Area -->
+                <div class="upload-area" id="uploadArea">
+                    <div style="font-size: 40px; margin-bottom: 10px;">📁</div>
+                    <p style="font-size: 16px; margin-bottom: 10px;" id="uploadAreaTitle"><strong>ลากไฟล์หรือโฟลเดอร์มาที่นี่</strong></p>
+                    <p style="color: #999; font-size: 14px; margin-bottom: 20px;">รองรับไฟล์: .xlsx, .xls, .csv (ขนาดสูงสุด 50MB)</p>
+                    <div style="display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;" id="uploadButtons">
+                        <button class="btn-upload" onclick="document.getElementById('fileInput').click()">
+                            📄 เลือกไฟล์
+                        </button>
+                        <button class="btn-upload" onclick="document.getElementById('folderInput').click()">
+                            📁 เลือกโฟลเดอร์
+                        </button>
+                        <button class="btn-upload" onclick="showFolderPathModal()">
+                            🖨️ ระบุที่อยู่โฟลเดอร์
+                        </button>
+                    </div>
+                    <input type="file" id="fileInput" class="file-input" multiple accept=".xlsx,.xls,.csv">
+                    <input type="file" id="folderInput" class="file-input" webkitdirectory directory multiple accept=".xlsx,.xls,.csv">
+                </div>
+                
+                <!-- File List -->
+                <div class="file-list" id="fileList"></div>
+                
+                <!-- Check Button -->
+                <div style="text-align: center; margin-top: 20px;" id="checkButtonContainer">
+                    <button class="btn btn-primary btn-lg" id="checkButton" style="display: none; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border: none;">
+                        ✓ ตรวจสอบไฟล์ซ้ำ
+                    </button>
+                </div>
+                
+                <!-- Loading Spinner -->
+                <div class="loading" id="loading">
+                    <div class="spinner"></div>
+                    <p>กำลังประมวลผล... โปรดรอสักครู่</p>
+                </div>
+                
+                <!-- Results Section -->
+                <div class="results-section" id="resultsSection">
+                    <!-- Stats -->
+                    <div class="info-stats" id="statsContainer"></div>
+                    
+                    <!-- Duplicates Found -->
+                    <div id="duplicatesContainer"></div>
+                    
+                    <!-- Bad Files -->
+                    <div id="badFilesContainer"></div>
+                    
+                    <!-- All Files Table -->
+                    <div style="margin-top: 30px;">
+                        <h6>📊 รายละเอียดไฟล์ทั้งหมด</h6>
+                        <div class="table-responsive">
+                            <table class="table table-striped table-hover table-sm" id="resultsTable">
+                                <thead style="background: #f8f9fa;">
+                                    <tr>
+                                        <th>ชื่อไฟล์</th>
+                                        <th>จำนวนแถว</th>
+                                        <th>Hash (MD5)</th>
+                                        <th>สถานะ</th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Folder Path Modal -->
+    <div class="modal-overlay" id="folderPathModal">
+        <div class="modal-content">
+            <h5>🖨️ ระบุที่อยู่โฟลเดอร์</h5>
+            <p style="color: #666; font-size: 14px; margin-bottom: 15px;">ตัวอย่าง: C:\Users\YourName\Documents\Files</p>
+            <input 
+                type="text" 
+                id="folderPathInput" 
+                placeholder="กรุณากรอกที่อยู่โฟลเดอร์เต็ม" 
+                onkeypress="if(event.key==='Enter') processFolderPath()"
+            >
+            <div class="modal-buttons">
+                <button class="btn-secondary" onclick="closeFolderPathModal()">ยกเลิก</button>
+                <button class="btn-primary" onclick="processFolderPath()">ตรวจสอบ</button>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let selectedFiles = [];
+        let currentMode = 'duplicates'; // 'duplicates' or 'location'
+        
+        // Mode selection
+        function setMode(mode) {
+            currentMode = mode;
+            document.getElementById('modeCheckDuplicates').style.background = mode === 'duplicates' 
+                ? 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)' 
+                : '#ddd';
+            document.getElementById('modeCheckDuplicates').style.color = mode === 'duplicates' ? 'white' : '#333';
+            
+            document.getElementById('modeAnalyzeLocation').style.background = mode === 'location' 
+                ? 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)' 
+                : '#ddd';
+            document.getElementById('modeAnalyzeLocation').style.color = mode === 'location' ? 'white' : '#333';
+            
+            // Update upload area based on mode
+            const uploadAreaTitle = document.getElementById('uploadAreaTitle');
+            const uploadButtons = document.getElementById('uploadButtons');
+            
+            if (mode === 'location') {
+                uploadAreaTitle.innerHTML = '<strong>ระบุที่อยู่โฟลเดอร์สำหรับการวิเคราะห์ตำแหน่ง</strong>';
+                uploadButtons.innerHTML = `
+                    <button class="btn-upload" onclick="showFolderPathModal()">
+                        🖨️ ระบุที่อยู่โฟลเดอร์
+                    </button>
+                `;
+            } else {
+                uploadAreaTitle.innerHTML = '<strong>ลากไฟล์หรือโฟลเดอร์มาที่นี่</strong>';
+                uploadButtons.innerHTML = `
+                    <button class="btn-upload" onclick="document.getElementById('fileInput').click()">
+                        📄 เลือกไฟล์
+                    </button>
+                    <button class="btn-upload" onclick="document.getElementById('folderInput').click()">
+                        📁 เลือกโฟลเดอร์
+                    </button>
+                    <button class="btn-upload" onclick="showFolderPathModal()">
+                        🖨️ ระบุที่อยู่โฟลเดอร์
+                    </button>
+                `;
+            }
+            
+            // Clear previous results
+            selectedFiles = [];
+            updateFileList();
+            document.getElementById('resultsSection').classList.remove('show');
+        }
+        
+        // Modal functions
+        function showFolderPathModal() {
+            document.getElementById('folderPathModal').classList.add('show');
+            document.getElementById('folderPathInput').focus();
+        }
+        
+        function closeFolderPathModal() {
+            document.getElementById('folderPathModal').classList.remove('show');
+            document.getElementById('folderPathInput').value = '';
+        }
+        
+        async function processFolderPath() {
+            const folderPath = document.getElementById('folderPathInput').value.trim();
+            
+            if (!folderPath) {
+                alert('กรุณากรอกที่อยู่โฟลเดอร์');
+                return;
+            }
+            
+            closeFolderPathModal();
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('resultsSection').classList.remove('show');
+            
+            try {
+                const endpoint = currentMode === 'location' ? '/api/analyze-location' : '/api/process-folder';
+                
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ folder_path: folderPath })
+                });
+                
+                const data = await response.json();
+                document.getElementById('loading').style.display = 'none';
+                
+                if (data.success) {
+                    if (currentMode === 'location') {
+                        displayLocationResults(data);
+                    } else {
+                        displayResults(data);
+                    }
+                } else {
+                    alert('เกิดข้อผิดพลาด: ' + data.error);
+                }
+            } catch (error) {
+                document.getElementById('loading').style.display = 'none';
+                alert('เกิดข้อผิดพลาด: ' + error.message);
+            }
+        }
+        
+        // Close modal on outside click
+        document.getElementById('folderPathModal').addEventListener('click', (e) => {
+            if (e.target.id === 'folderPathModal') {
+                closeFolderPathModal();
+            }
+        });
+        
+        // Drag and drop
+        const uploadArea = document.getElementById('uploadArea');
+        
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+        
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+        
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            const files = Array.from(e.dataTransfer.files);
+            addFiles(files);
+        });
+        
+        // File input change
+        document.getElementById('fileInput').addEventListener('change', (e) => {
+            const files = Array.from(e.target.files);
+            addFiles(files);
+        });
+        
+        // Folder input change
+        document.getElementById('folderInput').addEventListener('change', (e) => {
+            const files = Array.from(e.target.files);
+            // Filter only allowed file types
+            const allowedTypes = ['.xlsx', '.xls', '.csv'];
+            const filteredFiles = files.filter(file => {
+                return allowedTypes.some(type => file.name.toLowerCase().endsWith(type));
+            });
+            if (filteredFiles.length > 0) {
+                addFiles(filteredFiles);
+            } else {
+                alert('โฟลเดอร์นี้ไม่มีไฟล์ .xlsx, .xls, หรือ .csv');
+            }
+        });
+        
+        function addFiles(files) {
+            if (currentMode === 'location') {
+                alert('โปรดใช้ "ระบุที่อยู่โฟลเดอร์" สำหรับการวิเคราะห์ตำแหน่ง');
+                return;
+            }
+            
+            files.forEach(file => {
+                if (!selectedFiles.find(f => f.name === file.name)) {
+                    selectedFiles.push(file);
+                }
+            });
+            updateFileList();
+        }
+        
+        function updateFileList() {
+            const fileList = document.getElementById('fileList');
+            fileList.innerHTML = '';
+            
+            // Show file list only for duplicates mode
+            if (currentMode === 'location') {
+                document.getElementById('checkButton').style.display = 'none';
+                return;
+            }
+            
+            if (selectedFiles.length === 0) {
+                document.getElementById('checkButton').style.display = 'none';
+                return;
+            }
+            
+            selectedFiles.forEach((file, index) => {
+                const div = document.createElement('div');
+                div.className = 'file-item';
+                div.innerHTML = `
+                    <span>📄 ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)</span>
+                    <button class="remove-btn" onclick="removeFile(${index})">ลบ</button>
+                `;
+                fileList.appendChild(div);
+            });
+            
+            document.getElementById('checkButton').style.display = 'block';
+        }
+        
+        function removeFile(index) {
+            selectedFiles.splice(index, 1);
+            updateFileList();
+        }
+        
+        // Check for duplicates
+        document.getElementById('checkButton').addEventListener('click', checkFiles);
+        
+        async function checkFiles() {
+            if (currentMode === 'location') {
+                alert('โปรดใช้ "ระบุที่อยู่โฟลเดอร์" สำหรับการวิเคราะห์ตำแหน่ง');
+                return;
+            }
+            
+            if (selectedFiles.length === 0) {
+                alert('กรุณาเลือกไฟล์ก่อน');
+                return;
+            }
+            
+            const formData = new FormData();
+            selectedFiles.forEach(file => {
+                formData.append('files', file);
+            });
+            
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('resultsSection').classList.remove('show');
+            
+            try {
+                const response = await fetch('/api/upload-files', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                document.getElementById('loading').style.display = 'none';
+                
+                if (data.success) {
+                    displayResults(data);
+                } else {
+                    alert('เกิดข้อผิดพลาด: ' + data.error);
+                }
+            } catch (error) {
+                document.getElementById('loading').style.display = 'none';
+                alert('เกิดข้อผิดพลาด: ' + error.message);
+            }
+        }
+        
+        function displayResults(data) {
+            // Stats
+            const statsContainer = document.getElementById('statsContainer');
+            statsContainer.innerHTML = `
+                <div class="stat-box">
+                    <div class="number">${data.total_files}</div>
+                    <div class="label">ไฟล์ทั้งหมด</div>
+                </div>
+                <div class="stat-box">
+                    <div class="number">${data.processed_files}</div>
+                    <div class="label">ไฟล์ที่ประมวลผล</div>
+                </div>
+                <div class="stat-box">
+                    <div class="number">${data.duplicate_groups}</div>
+                    <div class="label">กลุ่มไฟล์ซ้ำ</div>
+                </div>
+                <div class="stat-box">
+                    <div class="number">${data.bad_files}</div>
+                    <div class="label">ไฟล์ที่ผิดพลาด</div>
+                </div>
+            `;
+            
+            // Duplicates
+            const duplicatesContainer = document.getElementById('duplicatesContainer');
+            if (data.duplicate_groups > 0) {
+                let html = '<div class="alert-duplicate"><strong>⚠️ พบไฟล์ซ้ำ:</strong></div>';
+                data.duplicates.forEach((group, idx) => {
+                    html += `
+                        <div class="duplicate-group">
+                            <h6>🔗 กลุ่มที่ ${idx + 1} - จำนวน ${group.count} ไฟล์</h6>
+                    `;
+                    group.files.forEach(file => {
+                        html += `
+                            <div class="duplicate-file">
+                                📄 ${file.filename} (${file.row_count} แถว)
+                            </div>
+                        `;
+                    });
+                    html += '</div>';
+                });
+                duplicatesContainer.innerHTML = html;
+            } else {
+                duplicatesContainer.innerHTML = '<div class="alert-success-check"><strong>✓ ไม่มีไฟล์ซ้ำ</strong></div>';
+            }
+            
+            // Bad Files
+            const badFilesContainer = document.getElementById('badFilesContainer');
+            if (data.bad_files > 0) {
+                let html = '<div class="alert-danger-check"><strong>❌ ไฟล์ที่ผิดพลาด:</strong><ul style="margin: 10px 0 0 20px;">';
+                data.bad_files_list.forEach(file => {
+                    html += `<li>${file.filename}: ${file.reason}</li>`;
+                });
+                html += '</ul></div>';
+                badFilesContainer.innerHTML = html;
+            } else {
+                badFilesContainer.innerHTML = '';
+            }
+            
+            // Results Table
+            const tableBody = document.getElementById('resultsTable').querySelector('tbody');
+            tableBody.innerHTML = '';
+            data.file_results.forEach(file => {
+                const row = tableBody.insertRow();
+                row.innerHTML = `
+                    <td>${file.filename}</td>
+                    <td>${file.row_count}</td>
+                    <td><code style="font-size: 11px;">${file.hash.substring(0, 16)}...</code></td>
+                    <td><span class="badge" style="background: #28a745; color: white;">✓ สำเร็จ</span></td>
+                `;
+            });
+            
+            document.getElementById('resultsSection').classList.add('show');
+        }
+        
+        function displayLocationResults(data) {
+            // Stats
+            const statsContainer = document.getElementById('statsContainer');
+            statsContainer.innerHTML = `
+                <div class="stat-box">
+                    <div class="number">${data.total_files}</div>
+                    <div class="label">ไฟล์ทั้งหมด</div>
+                </div>
+                <div class="stat-box">
+                    <div class="number">${data.total_rows}</div>
+                    <div class="label">จำนวนแถว</div>
+                </div>
+                <div class="stat-box">
+                    <div class="number">${data.unique_locations}</div>
+                    <div class="label">ตำแหน่งที่ไม่ซ้ำ</div>
+                </div>
+                <div class="stat-box">
+                    <div class="number">${data.bad_files}</div>
+                    <div class="label">ไฟล์ที่ผิดพลาด</div>
+                </div>
+            `;
+            
+            // Location Summary
+            const duplicatesContainer = document.getElementById('duplicatesContainer');
+            let html = '<h6 style="margin-top: 20px;">📍 สรุปตำแหน่ง</h6>';
+            
+            data.summary_data.forEach(item => {
+                html += `
+                    <div class="duplicate-group">
+                        <h6>📍 ${item.Location} - ไฟล์ที่ไม่ซ้ำ: ${item.Unique_Files}</h6>
+                    </div>
+                `;
+            });
+            
+            duplicatesContainer.innerHTML = html;
+            
+            // Bad Files
+            const badFilesContainer = document.getElementById('badFilesContainer');
+            if (data.bad_files > 0) {
+                let badHtml = '<div class="alert-danger-check"><strong>❌ ไฟล์ที่ผิดพลาด:</strong><ul style="margin: 10px 0 0 20px;">';
+                data.bad_files_list.forEach(file => {
+                    badHtml += `<li>${file.filename}: ${file.reason}</li>`;
+                });
+                badHtml += '</ul></div>';
+                badFilesContainer.innerHTML = badHtml;
+            } else {
+                badFilesContainer.innerHTML = '';
+            }
+            
+            // Groupby Table - Location & Filename
+            const tableBody = document.getElementById('resultsTable').querySelector('tbody');
+            document.getElementById('resultsTable').querySelector('thead').innerHTML = `
+                <tr>
+                    <th>ตำแหน่ง (Location)</th>
+                    <th>ชื่อไฟล์</th>
+                    <th>จำนวน</th>
+                    <th>สถานะ</th>
+                </tr>
+            `;
+            tableBody.innerHTML = '';
+            
+            data.groupby_data.slice(0, 50).forEach(item => {
+                const row = tableBody.insertRow();
+                row.innerHTML = `
+                    <td>${item.Location}</td>
+                    <td>${item.Filename}</td>
+                    <td><span class="badge" style="background: #667eea; color: white;">${item.Count}</span></td>
+                    <td><span class="badge" style="background: #28a745; color: white;">✓ สำเร็จ</span></td>
+                `;
+            });
+            
+            if (data.groupby_data.length > 50) {
+                const row = tableBody.insertRow();
+                row.innerHTML = `
+                    <td colspan="4" style="text-align: center; color: #999;">
+                        ... และอีก ${data.groupby_data.length - 50} แถว (แสดง 50 แถวแรก)
+                    </td>
+                `;
+            }
+            
+            document.getElementById('resultsSection').classList.add('show');
+        }
+    </script>
+</body>
+</html>
