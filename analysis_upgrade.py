@@ -1,0 +1,1590 @@
+"""
+============================================================
+analysis_upgrade.py
+============================================================
+โค้ดนี้ใช้แทน Cell ที่ 6 ของ RobustRollingforAI.ipynb ทั้งหมด
+
+การเปลี่ยนแปลง 4 จุด:
+  1. กรอง Bill IB/IBK/DM ก่อนคำนวณ Z-Score (ตัด noise)
+  2. Expected_Import → EWMA prediction + Diag_Candidate (ไม่ใช่ median)
+  3. เพิ่ม Focus_Columns (แนะนำคอลัมน์ที่ต้องดูตาม Anomaly)
+  4. เพิ่ม Anomaly_Evidence (เหตุผลรับรองสำหรับบิล/ลืมคีย์)
+
+วิธีใช้:
+  Copy โค้ดทั้งหมดไปวางแทน Cell ที่ 6 ในไฟล์ RobustRollingforAI.ipynb
+============================================================
+"""
+
+import math
+import re
+
+import numpy as np
+import openpyxl
+import pandas as pd
+
+
+# ============================================================
+# 1. เตรียมและทำความสะอาดข้อมูล
+# ============================================================
+df = data[
+    [
+        'DATE',
+        'Bill',
+        'details',
+        'product_id',
+        'import',
+        'export',
+        'balances',
+    ]
+].copy()
+
+df.columns = df.columns.str.strip()
+df['product_id'] = df['product_id'].astype(str).str.strip()
+df['Bill'] = df['Bill'].astype(str).str.strip()
+df['details'] = df['details'].astype(str).str.strip()
+df['DATE'] = pd.to_datetime(df['DATE'])
+
+for col in ['import', 'export', 'balances']:
+    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+df = df.sort_values(by=['product_id', 'DATE']).reset_index(drop=True)
+
+
+# ============================================================
+# 2. ฟังก์ชัน Robust Z-Score (Vectorized - Logic เดิม)
+# ============================================================
+def compute_robust_iqr_zscore_import_fast(df_filtered, col='import'):
+    grouped = df_filtered.groupby('product_id')[col]
+
+    group_median = grouped.transform('median')
+    group_count = grouped.transform('count')
+
+    # IQR
+    q1 = grouped.transform('quantile', 0.25)
+    q3 = grouped.transform('quantile', 0.75)
+    iqr_scaled = (q3 - q1) * 0.7413
+
+    # MAD
+    mad_raw = (
+        (df_filtered[col] - group_median)
+        .abs()
+        .groupby(df_filtered['product_id'])
+        .transform('median')
+    )
+    mad_scaled = mad_raw * 1.4826
+
+    min_divisor = np.maximum(group_median * 0.3, 1.0)
+
+    final_divisor = np.where(
+        (iqr_scaled > 0) & (group_count >= 10), iqr_scaled, mad_scaled
+    )
+    final_divisor = np.maximum(final_divisor, min_divisor)
+
+    diff = df_filtered[col] - group_median
+    z_score = diff / final_divisor
+
+    return z_score, group_median
+
+
+# ============================================================
+# 3. ★ กรอง Bill IB/IBK/DM ก่อนคำนวณ Z-Score ★
+#    (แก้ไขจุดที่ 1: ตัด noise จากบิลที่ไม่ใช่ Inbound จริง)
+# ============================================================
+bill_upper = df['Bill'].fillna('').astype(str).str.upper().str.strip()
+df['is_valid_import_bill'] = bill_upper.str.startswith(('IB', 'IBK', 'DM'))
+
+# กรองเฉพาะ Import > 0 ที่ Bill ขึ้นต้นด้วย IB / IBK / DM
+df_imp = df[
+    (df['import'] > 0)
+    & (df['is_valid_import_bill'])
+].copy()
+
+df['Expected_Import'] = np.nan
+df['Diff_Import'] = np.nan
+df['ZScore_Import'] = np.nan
+df['is_outlier_import'] = False
+
+if not df_imp.empty:
+    df_imp['ZScore_Import'], df_imp['_median_import'] = (
+        compute_robust_iqr_zscore_import_fast(df_imp, 'import')
+    )
+
+    df_imp['is_outlier_import'] = (
+        (df_imp['ZScore_Import'] > 2.5)
+        & ((df_imp['import'] - df_imp['_median_import']) >= 5)
+    )
+
+    df.loc[df_imp.index, 'ZScore_Import'] = df_imp['ZScore_Import']
+    df.loc[df_imp.index, 'is_outlier_import'] = df_imp['is_outlier_import']
+
+
+# ============================================================
+# 3.1 ★ EWMA Prediction สำหรับ Expected_Import ★
+#     (แก้ไขจุดที่ 2: ทำนายจริง ไม่ใช่ยก median มาใส่)
+#
+#     EWMA (Exponential Weighted Moving Average)
+#     ให้น้ำหนักบิลรับเข้าล่าสุดมากกว่าบิลเก่า
+#     span=5 เป็น default parameter (ปรับได้)
+# ============================================================
+def ewma_predict_per_sku(group):
+    """
+    คำนวณ EWMA prediction ต่อ SKU แบบ Dynamic (Span ตามปริมาณบิลของแต่ละรายการ)
+    ใช้เฉพาะ valid import bills (IB/IBK/DM) ที่ import > 0
+    """
+    valid_mask = (group['import'] > 0) & (group['is_valid_import_bill'])
+    valid = group.loc[valid_mask, 'import']
+
+    result = pd.Series(np.nan, index=group.index)
+
+    if valid.empty:
+        return result
+
+    # Dynamic Span: อิงตามจำนวนบิลรับเข้าที่มีของแต่ละ SKU (3 ถึง 10)
+    dynamic_span = max(3, min(10, len(valid) // 2))
+
+    # EWMA ของประวัติรับเข้าจริง
+    ewma_vals = valid.ewm(span=dynamic_span, min_periods=1).mean()
+    result.loc[valid.index] = ewma_vals
+
+    # กระจายค่า prediction ไปยังแถวอื่นด้วย forward-fill + back-fill
+    result = result.ffill().bfill()
+
+    return result
+
+# คำนวณ EWMA prediction ต่อ SKU
+df['_ewma_expected'] = (
+    df.groupby('product_id', group_keys=False)
+    .apply(ewma_predict_per_sku)
+)
+
+# Expected_Import เบื้องต้น: ถ้ามี import > 0 ใช้ EWMA prediction
+# ถ้า import == 0 ใส่ NaN (ไม่ใช่ anomaly ส่วนนี้)
+df['Expected_Import'] = np.where(
+    df['import'] > 0,
+    df['_ewma_expected'],
+    np.nan
+)
+
+df['Diff_Import'] = np.where(
+    df['import'] > 0,
+    df['import'] - df['Expected_Import'],
+    np.nan
+)
+
+df.drop(columns=['_ewma_expected'], inplace=True, errors='ignore')
+
+# ============================================================
+# สำหรับแถวที่ import > 0 แต่ไม่ใช่ valid bill → Expected = import เดิม
+# (ไม่ถูกกรองเป็น outlier แต่ยังคง Expected ไว้เพื่อความครบถ้วน)
+# ============================================================
+non_valid_import_mask = (
+    (df['import'] > 0)
+    & (~df['is_valid_import_bill'])
+    & (df['Expected_Import'].isna())
+)
+df.loc[non_valid_import_mask, 'Expected_Import'] = (
+    df.loc[non_valid_import_mask, 'import']
+)
+df.loc[non_valid_import_mask, 'Diff_Import'] = 0
+
+
+# ============================================================
+# 4. Dynamic Idle Threshold & Hypothesis Conditions (Logic เดิม)
+# ============================================================
+sales_events = df[df['export'] > 0].copy()
+
+if not sales_events.empty:
+    sales_events['prev_export_date'] = sales_events.groupby('product_id')[
+        'DATE'
+    ].shift(1)
+
+    sales_events['inter_sale_days'] = (
+        sales_events['DATE'] - sales_events['prev_export_date']
+    ).dt.days
+
+    sale_stats = (
+        sales_events.groupby('product_id')['inter_sale_days']
+        .median()
+        .reset_index()
+    )
+
+    sale_stats.rename(
+        columns={'inter_sale_days': 'median_inter_sale_days'},
+        inplace=True
+    )
+
+    df = df.merge(sale_stats, on='product_id', how='left')
+else:
+    df['median_inter_sale_days'] = np.nan
+
+df['median_inter_sale_days'] = (
+    df['median_inter_sale_days'].fillna(2.0)
+)
+df['median_inter_sale_days'] = np.maximum(
+    df['median_inter_sale_days'], 1.0
+)
+
+# วันนิ่งเฉย
+df['export_date_temp'] = df['DATE'].where(df['export'] > 0)
+df['last_export_date'] = (
+    df.groupby('product_id')['export_date_temp'].ffill()
+)
+df['days_idle'] = (
+    df['DATE'] - df['last_export_date']
+).dt.days.fillna(0)
+df.drop(columns=['export_date_temp'], inplace=True)
+
+# หาระยะเวลาจนกว่าจะขายครั้งถัดไป (Dynamic based on each SKU's timeline)
+df['export_date_temp_bfill'] = df['DATE'].where(df['export'] > 0)
+df['next_export_date'] = df.groupby('product_id')['export_date_temp_bfill'].bfill()
+df['days_to_next_export'] = (df['next_export_date'] - df['DATE']).dt.days.fillna(np.inf)
+df.drop(columns=['export_date_temp_bfill'], inplace=True)
+
+# Ghost Stock
+df['dynamic_idle_threshold_c1'] = np.ceil(
+    df['median_inter_sale_days'] * 1.5
+)
+
+df['is_suspected_ghost'] = (
+    (df['days_idle'] > df['dynamic_idle_threshold_c1'])
+    & (df['balances'] > 0)
+    & (df['import'] > 0)
+    & (df['days_to_next_export'] <= df['dynamic_idle_threshold_c1'])  # ขายออกภายใน Threshold ตัวเอง
+)
+
+# Dead Stock
+df['dynamic_idle_threshold_c2'] = np.ceil(
+    df['median_inter_sale_days'] * 1.8
+)
+
+df['is_dead_last_item'] = (
+    (df['days_idle'] > df['dynamic_idle_threshold_c2'])
+    & (df['balances'] > 0)
+    & (df['import'] == 0)
+)
+
+df['hypothesis_zero_stock'] = (
+    df['is_suspected_ghost'] | df['is_dead_last_item']
+)
+
+
+# ============================================================
+# 5. จับอาการ "ฟันหลอ" (Logic เดิม)
+# ============================================================
+import_events = df[df['import'] > 0].copy()
+
+if not import_events.empty:
+    import_events['prev_import_date'] = (
+        import_events.groupby('product_id')['DATE'].shift(1)
+    )
+
+    import_events['inbound_gap_days'] = (
+        import_events['DATE']
+        - import_events['prev_import_date']
+    ).dt.days
+
+    inbound_stats = (
+        import_events.groupby('product_id')['inbound_gap_days']
+        .expanding(min_periods=2)  # Dynamic Window: ใช้ประวัติช่องว่างทั้งหมดที่เติบโตขึ้นเรื่อยๆของสินค้านั้น
+        .median()
+        .reset_index(level=0, drop=True)
+    )
+
+    import_events['expected_inbound_gap'] = inbound_stats
+
+    df.loc[import_events.index, 'inbound_gap_days'] = (
+        import_events['inbound_gap_days']
+    )
+
+    df.loc[import_events.index, 'expected_inbound_gap'] = (
+        import_events['expected_inbound_gap']
+    )
+
+df['days_since_last_import'] = (
+    df['DATE']
+    - df['DATE'].where(df['import'] > 0)
+    .groupby(df['product_id']).ffill()
+).dt.days.fillna(0)
+
+df['expected_inbound_gap'] = (
+    df.groupby('product_id')['expected_inbound_gap'].ffill()
+)
+
+df['expected_inbound_gap'] = (
+    df['expected_inbound_gap'].fillna(3.0)
+)
+
+# ตรวจสอบว่ามีการเคลื่อนไหวขายเมื่อเร็วๆนี้เมื่อเทียบกับค่าเฉลี่ยของตัวเอง (Dynamic Recent Sales)
+df['dynamic_recent_sales_threshold'] = np.maximum(7, df['median_inter_sale_days'] * 1.5)
+
+df['is_missing_inbound_bill'] = (
+    df['days_since_last_import']
+    > (df['expected_inbound_gap'] * 2.0)
+) & (df['days_idle'] <= df['dynamic_recent_sales_threshold'])
+
+
+# ============================================================
+# 6. คำนวณช่วงเวลาที่สงสัย + ประเมินจำนวนสินค้า (Logic เดิม)
+# ============================================================
+df['last_import_date'] = df['DATE'].where(df['import'] > 0)
+df['last_import_date'] = (
+    df.groupby('product_id')['last_import_date'].ffill()
+)
+
+df['suspected_missing_period'] = np.where(
+    df['is_missing_inbound_bill'],
+    df['last_import_date'].dt.strftime('%Y-%m-%d')
+    + ' ถึง '
+    + df['DATE'].dt.strftime('%Y-%m-%d'),
+    None,
+)
+
+df['import_group'] = (
+    (df['import'] > 0)
+    .groupby(df['product_id'])
+    .cumsum()
+)
+
+df['cum_export_since_import'] = (
+    df.groupby(['product_id', 'import_group'])['export']
+    .cumsum()
+)
+
+df['min_bal_in_gap'] = (
+    df.groupby(['product_id', 'import_group'])['balances']
+    .transform('min')
+)
+
+df['estimated_missing_qty'] = np.where(
+    df['is_missing_inbound_bill'],
+    np.where(
+        df['min_bal_in_gap'] < 0,
+        df['min_bal_in_gap'].abs(),
+        df['cum_export_since_import'],
+    ),
+    0.0,
+)
+
+df.drop(
+    columns=[
+        'last_import_date',
+        'import_group',
+        'cum_export_since_import',
+        'min_bal_in_gap',
+    ],
+    inplace=True
+)
+
+
+# ============================================================
+# ============================================================
+# 7. Reverse Outlier Matching & Stock Reconciliation
+# ============================================================
+df['net_flow'] = df['import'] - df['export']
+
+# ใช้ Balance บรรทัดสุดท้ายของสินค้านั้นๆ เป็นตัวตั้งคำนวณย้อนกลับ
+df['period_end_balance'] = df.groupby('product_id')['balances'].transform('last')
+
+df['inferred_import'] = df['import'] - df['period_end_balance']
+
+# Reverse Reconciliation: คำนวณทุกแถวที่ import > 0
+# ถ้ายอดรับเข้ามากกว่าสต็อกปลายทาง → มีส่วนเกินที่น่าสงสัย
+reverse_mask = (df['import'] > 0) & (df['import'] > df['period_end_balance'])
+
+df['adjusted_import'] = np.where(
+    reverse_mask,
+    df['inferred_import'],
+    df['import'],
+)
+
+# ★ Expected_Import ปรับจาก Reverse Reconciliation (ทุกบิลที่ import > end_balance) ★
+df['Expected_Import'] = np.where(
+    reverse_mask,
+    df['inferred_import'],
+    df['Expected_Import'],
+)
+
+df['Diff_Import'] = np.where(
+    df['import'] > 0,
+    df['import'] - df['Expected_Import'],
+    np.nan
+)
+
+df['adjusted_net_flow'] = (
+    df['adjusted_import'] - df['export']
+)
+
+first_balance_actual = (
+    df.groupby('product_id')['balances'].transform('first')
+)
+
+first_net_flow_actual = (
+    df.groupby('product_id')['net_flow'].transform('first')
+)
+
+true_initial_balance = (
+    first_balance_actual - first_net_flow_actual
+)
+
+df['adjusted_calc_balance'] = (
+    true_initial_balance
+    + df.groupby('product_id')['adjusted_net_flow'].cumsum()
+)
+
+df['is_ghost_stock'] = (
+    (df['is_suspected_ghost'] == True)
+    & (df['adjusted_calc_balance'] <= 0)
+    & (df['balances'] > 0)
+)
+
+calc_running_balance = (
+    true_initial_balance
+    + df.groupby('product_id')['net_flow'].cumsum()
+)
+
+df['is_balance_tampered'] = (
+    df['balances'] - calc_running_balance
+).abs() > 0
+
+df['is_stock_out'] = (
+    (df['balances'] <= 0)
+    & (df['export'] > 0)
+)
+
+
+# ============================================================
+# 8. สรุปประเภท Anomaly (Logic เดิม)
+# ============================================================
+anomaly_conditions = [
+    (df['is_stock_out'] == True),
+    (df['is_ghost_stock'] == True),
+    (df['is_dead_last_item'] == True),
+    (df['is_balance_tampered'] == True),
+    (df['is_missing_inbound_bill'] == True),
+    (df['is_outlier_import'] == True)
+    & (df['ZScore_Import'] > 2.5),
+    (df['days_idle'] > df['dynamic_idle_threshold_c1'])
+    & (df['balances'] > 0),
+]
+
+anomaly_labels = [
+    '🛑 สต็อกหมด/ติดลบ (Stock Out Alert)',
+    '🚨 บิลเข้าคีย์เกินจนสต็อกบวม (Ghost Stock Alert)',
+    '📦 สต็อกค้างนานไร้การเคลื่อนไหว (Dead Stock / 1.8x Idle)',
+    '🚨 ยอดคงเหลือไม่ตรง/มีการแก้บิลย้อนหลัง (Balance Mismatch)',
+    '🔴 อาการฟันหลอ: ลืมคีย์บิลรับเข้า (Missing Import Bill)',
+    '🔵 ยอดเข้าพุ่งสูงผิดปกติ (Over-Import)',
+    '🟣 สินค้านิ่งเกินปกติ (Stagnant / Idle Alert)',
+]
+
+df['Anomaly_Type'] = np.select(
+    anomaly_conditions,
+    anomaly_labels,
+    default='⚪ ปกติ (Normal)'
+)
+
+
+# ################################################################
+# ################################################################
+#
+# 9. ROOT CAUSE DIAGNOSIS LAYER
+#    ============================================================
+#    ส่วนนี้เป็น "การเสริม" ไม่ได้แทน STEP 1-8
+#
+#    Detection = บอกว่าผิดปกติหรือไม่
+#    Diagnosis = พยายามบอกว่าผิดเพราะอะไร
+#
+# ################################################################
+# ################################################################
+
+# ============================================================
+# 9.1 — is_valid_import_bill ถูกสร้างไว้แล้วใน Section 3
+#        ไม่ต้องสร้างซ้ำ
+# ============================================================
+
+
+# ============================================================
+# 9.2 ฟังก์ชันช่วย: Integer / Numeric
+# ============================================================
+def _is_positive_number(x):
+    try:
+        return pd.notna(x) and float(x) > 0
+    except Exception:
+        return False
+
+
+def _safe_int(x):
+    if pd.isna(x):
+        return None
+    try:
+        value = float(x)
+        if value <= 0:
+            return None
+        rounded = int(round(value))
+        if abs(value - rounded) < 1e-9:
+            return rounded
+    except Exception:
+        pass
+    return None
+
+
+def _fmt_num(x):
+    if x is None or pd.isna(x):
+        return '-'
+    try:
+        xf = float(x)
+        if xf.is_integer():
+            return str(int(xf))
+        return f'{xf:g}'
+    except Exception:
+        return str(x)
+
+
+# ============================================================
+# 9.3 หา Mode ที่น่าเชื่อถือ
+# ============================================================
+def reliable_inner_from_history(import_values, master_unit):
+    """
+    หา Inner Pack จากประวัติ Import จริง
+
+    เกณฑ์ตาม Logic:
+    - ดูยอดย่อยกว่า Master
+    - Ratio >= 30% OR Count >= 3
+    - ต้องเป็นจำนวนเต็มบวก
+    - ไม่เอา Master มาเป็น Inner
+    """
+
+    if master_unit is None or master_unit <= 1:
+        return None, 0, 0.0, 'NO_MASTER'
+
+    s = pd.to_numeric(
+        pd.Series(import_values),
+        errors='coerce'
+    ).dropna()
+
+    s = s[s > 0]
+
+    if s.empty:
+        return None, 0, 0.0, 'NO_HISTORY'
+
+    integer_values = s[
+        np.isclose(s, np.round(s))
+    ].round().astype(int)
+
+    sub = integer_values[
+        integer_values < int(master_unit)
+    ]
+
+    if sub.empty:
+        return None, 0, 0.0, 'NO_SUBUNIT'
+
+    counts = sub.value_counts()
+
+    total_sub = len(sub)
+
+    candidates = []
+
+    for value, count in counts.items():
+        ratio = count / total_sub if total_sub else 0
+
+        # Candidate ต้องเป็นตัวหาร Master
+        if int(master_unit) % int(value) == 0:
+            reliable = (ratio >= 0.30) or (count >= 3)
+
+            if reliable:
+                candidates.append(
+                    (
+                        int(value),
+                        int(count),
+                        float(ratio)
+                    )
+                )
+
+    if not candidates:
+        return None, 0, 0.0, 'NO_RELIABLE_INNER'
+
+    candidates.sort(
+        key=lambda x: (x[2], x[1], x[0]),
+        reverse=True
+    )
+
+    inner, count, ratio = candidates[0]
+
+    return inner, count, ratio, 'RELIABLE'
+
+
+# ============================================================
+# 9.4 หา Master จากประวัติ
+# ============================================================
+def infer_master_unit(history_values):
+    s = pd.to_numeric(
+        pd.Series(history_values),
+        errors='coerce'
+    ).dropna()
+
+    s = s[s > 0]
+
+    if s.empty:
+        return None, 0, 0.0, 'NO_HISTORY'
+
+    integer_values = s[
+        np.isclose(s, np.round(s))
+    ].round().astype(int)
+
+    if integer_values.empty:
+        return None, 0, 0.0, 'NO_INTEGER_HISTORY'
+
+    counts = integer_values.value_counts()
+
+    candidates = []
+
+    for value, count in counts.items():
+        if value <= 1:
+            continue
+
+        ratio = count / len(integer_values)
+
+        candidates.append(
+            (
+                int(value),
+                int(count),
+                float(ratio)
+            )
+        )
+
+    if not candidates:
+        return None, 0, 0.0, 'NO_MASTER'
+
+    candidates.sort(
+        key=lambda x: (x[0], x[2], x[1]),
+        reverse=True
+    )
+
+    master, count, ratio = candidates[0]
+
+    return master, count, ratio, 'INFERRED'
+
+
+# ============================================================
+# 9.5 ตรวจ Base Unit
+# ============================================================
+def infer_base_unit(history_values, inner_unit=None):
+    s = pd.to_numeric(
+        pd.Series(history_values),
+        errors='coerce'
+    ).dropna()
+
+    s = s[s > 0]
+
+    if s.empty:
+        return 1, False
+
+    integer_values = s[
+        np.isclose(s, np.round(s))
+    ].round().astype(int)
+
+    if integer_values.empty:
+        return 1, False
+
+    if (integer_values == 1).any():
+        return 1, True
+
+    if inner_unit is not None and inner_unit > 1:
+        sub = integer_values[
+            integer_values < inner_unit
+        ]
+
+        if not sub.empty:
+            return 1, True
+
+        remainder_exists = (
+            integer_values % int(inner_unit) != 0
+        ).any()
+
+        if remainder_exists:
+            return 1, True
+
+    return 1, False
+
+
+# ============================================================
+# 9.6 Breakdown จำนวนชิ้น
+# ============================================================
+def breakdown_quantity(qty, master=None, inner=None):
+    result = {
+        'master_qty': 0,
+        'inner_qty': 0,
+        'base_qty': 0,
+        'text': _fmt_num(qty) + ' ชิ้น'
+    }
+
+    if qty is None or pd.isna(qty):
+        return result
+
+    try:
+        q = int(round(float(qty)))
+    except Exception:
+        return result
+
+    if q < 0:
+        return result
+
+    remaining = q
+
+    if master is not None and master > 1:
+        master_qty = remaining // int(master)
+        remaining = remaining % int(master)
+        result['master_qty'] = master_qty
+
+    if inner is not None and inner > 1:
+        inner_qty = remaining // int(inner)
+        remaining = remaining % int(inner)
+        result['inner_qty'] = inner_qty
+
+    result['base_qty'] = remaining
+
+    parts = []
+
+    if result['master_qty'] > 0:
+        parts.append(f"{result['master_qty']} ลัง")
+
+    if result['inner_qty'] > 0:
+        parts.append(f"{result['inner_qty']} แพ็ค")
+
+    if result['base_qty'] > 0:
+        parts.append(f"{result['base_qty']} ชิ้นเดี่ยว")
+
+    if parts:
+        result['text'] = ' + '.join(parts)
+    else:
+        result['text'] = '0 ชิ้น'
+
+    return result
+
+
+# ============================================================
+# 9.7 Re-validation Candidate
+# ============================================================
+def candidate_robust_score(history_values, candidate):
+    if candidate is None or candidate <= 0:
+        return np.inf, np.nan, np.nan, False
+
+    s = pd.to_numeric(
+        pd.Series(history_values),
+        errors='coerce'
+    ).dropna()
+
+    s = s[s > 0]
+
+    if s.empty:
+        return np.inf, np.nan, np.nan, False
+
+    median = float(s.median())
+
+    q1 = float(s.quantile(0.25))
+    q3 = float(s.quantile(0.75))
+
+    iqr_scaled = (q3 - q1) * 0.7413
+
+    mad_raw = float(
+        (s - median).abs().median()
+    )
+
+    mad_scaled = mad_raw * 1.4826
+
+    min_divisor = max(median * 0.3, 1.0)
+
+    if iqr_scaled > 0 and len(s) >= 10:
+        divisor = iqr_scaled
+    else:
+        divisor = mad_scaled
+
+    divisor = max(divisor, min_divisor)
+
+    z = (float(candidate) - median) / divisor
+
+    passed = abs(z) <= 2.5
+
+    return abs(float(z)), float(z), median, passed
+
+
+# ============================================================
+# 9.8 สร้าง Candidate Matrix
+# ============================================================
+def build_candidate_matrix(
+    observed_import,
+    master,
+    inner,
+    history_values,
+    ewma_prediction=None
+):
+    candidates = []
+
+    def add(name, formula, candidate):
+        if candidate is None:
+            return
+        if not np.isfinite(candidate):
+            return
+        if candidate <= 0:
+            return
+
+        score, z, median, passed = candidate_robust_score(
+            history_values,
+            candidate
+        )
+
+        candidates.append(
+            {
+                'hypothesis': name,
+                'formula': formula,
+                'candidate_base_qty': candidate,
+                'revalidation_score': score,
+                'revalidation_z': z,
+                'historical_median': median,
+                'revalidation_pass': passed,
+            }
+        )
+
+    if master is not None and master > 1:
+        if observed_import % master == 0:
+            candidate = observed_import / master
+            add(
+                'Barcode Swap: Master → Base',
+                f'{observed_import} / {master}',
+                candidate
+            )
+
+    if inner is not None and inner > 1:
+        if observed_import % inner == 0:
+            candidate = observed_import / inner
+            add(
+                'Barcode Swap: Inner → Base',
+                f'{observed_import} / {inner}',
+                candidate
+            )
+
+    add(
+        'Barcode Swap: Base',
+        f'{observed_import} / 1',
+        observed_import
+    )
+
+    if inner is not None and inner > 1:
+        inner_squared = inner ** 2
+        if observed_import % inner_squared == 0:
+            candidate = observed_import / inner_squared
+            add(
+                'Double Conversion: Inner × Inner',
+                f'{observed_import} / ({inner}²)',
+                candidate
+            )
+
+    if ewma_prediction is not None and ewma_prediction > 0:
+        add(
+            'Predictive Normalization',
+            'EWMA Predict',
+            ewma_prediction
+        )
+
+    return candidates
+
+
+# ============================================================
+# 9.9 เลือก Candidate ที่ดีที่สุด
+# ============================================================
+def select_best_candidate(candidates):
+    if not candidates:
+        return None
+
+    passed = [
+        x for x in candidates
+        if x['revalidation_pass']
+    ]
+
+    if passed:
+        passed.sort(
+            key=lambda x: (
+                x['revalidation_score'],
+                x['candidate_base_qty']
+            )
+        )
+        return passed[0]
+
+    return None
+
+
+# ============================================================
+# 9.10 Duplicate Entry Detection
+# ============================================================
+def detect_duplicate_imports(product_df):
+    temp = product_df[
+        product_df['is_valid_import_bill']
+        & (product_df['import'] > 0)
+    ].copy()
+
+    if temp.empty:
+        return False, 0
+
+    duplicate_bill = temp[
+        temp['Bill'].duplicated(keep=False)
+        & temp['Bill'].ne('')
+    ]
+
+    if not duplicate_bill.empty:
+        return True, len(duplicate_bill)
+
+    temp['date_only'] = temp['DATE'].dt.date
+
+    duplicate_same_day = temp[
+        temp.duplicated(
+            subset=['date_only', 'import'],
+            keep=False
+        )
+    ]
+
+    if not duplicate_same_day.empty:
+        return True, len(duplicate_same_day)
+
+    return False, 0
+
+
+# ============================================================
+# 9.11 Missing Import / Negative Stock Reconciliation
+# ============================================================
+def diagnose_missing_import(
+    product_df,
+    inner=None,
+    master=None
+):
+    result = {
+        'max_negative_qty': 0,
+        'suggested_pack_qty': 0,
+        'suggested_base_qty': 0,
+        'matched_history': False,
+        'matched_unit': None,
+    }
+
+    neg = product_df.loc[
+        product_df['balances'] < 0,
+        'balances'
+    ]
+
+    if neg.empty:
+        return result
+
+    max_negative = abs(float(neg.min()))
+    result['max_negative_qty'] = max_negative
+
+    pack_candidates = []
+
+    if inner is not None and inner > 1:
+        pack_candidates.append(('Inner', int(inner)))
+
+    if master is not None and master > 1:
+        pack_candidates.append(('Master', int(master)))
+
+    history = pd.to_numeric(
+        product_df.loc[
+            product_df['is_valid_import_bill']
+            & (product_df['import'] > 0),
+            'import'
+        ],
+        errors='coerce'
+    ).dropna()
+
+    history = history[history > 0]
+
+    for unit_name, pack in pack_candidates:
+        pack_qty = int(np.ceil(max_negative / pack))
+        suggested_base = pack_qty * pack
+
+        result['suggested_pack_qty'] = pack_qty
+        result['suggested_base_qty'] = suggested_base
+        result['matched_unit'] = unit_name
+
+        if not history.empty:
+            if np.isclose(history, suggested_base).any():
+                result['matched_history'] = True
+                return result
+
+            if np.isclose(history / pack, pack_qty).any():
+                result['matched_history'] = True
+                return result
+
+    return result
+
+
+# ============================================================
+# 9.12 Diagnosis ต่อ SKU / Bill
+# ============================================================
+def diagnose_row(row, product_history):
+    product_id = row['product_id']
+    observed = float(row['import'])
+
+    valid_history = product_history[
+        product_history['is_valid_import_bill']
+        & (product_history['import'] > 0)
+    ].copy()
+
+    history_values = valid_history['import'].tolist()
+
+    result = {
+        'Diag_Is_Checked': False,
+        'Diag_Root_Cause': 'ยังไม่ระบุ',
+        'Diag_Confidence': 'Low',
+        'Diag_Master_Unit': np.nan,
+        'Diag_Inner_Unit': np.nan,
+        'Diag_Base_Unit': 1,
+        'Diag_Tier_Structure': 'Unknown',
+        'Diag_Inner_Count': 0,
+        'Diag_Inner_Ratio': 0.0,
+        'Diag_Candidate': np.nan,
+        'Diag_Candidate_Hypothesis': None,
+        'Diag_Candidate_Formula': None,
+        'Diag_Revalidation_Z': np.nan,
+        'Diag_Revalidation_Score': np.nan,
+        'Diag_Revalidation_Pass': False,
+        'Diag_Breakdown': None,
+        'Diag_Max_Negative_Qty': 0,
+        'Diag_Suggested_Missing_Unit_Qty': 0,
+        'Diag_Suggested_Missing_Base_Qty': 0,
+        'Diag_Missing_History_Match': False,
+        'Diag_Duplicate': False,
+        'Diag_Evidence': None,
+    }
+
+    if (
+        not bool(row['is_outlier_import'])
+        and not bool(row['is_missing_inbound_bill'])
+        and not bool(row['is_stock_out'])
+        and not bool(row['is_balance_tampered'])
+        and not bool(row['is_ghost_stock'])
+        and not bool(row['is_dead_last_item'])
+    ):
+        return result
+
+    result['Diag_Is_Checked'] = True
+
+    # Master
+    master, master_count, master_ratio, master_status = (
+        infer_master_unit(history_values)
+    )
+    result['Diag_Master_Unit'] = (
+        master if master is not None else np.nan
+    )
+
+    # Inner
+    inner, inner_count, inner_ratio, inner_status = (
+        reliable_inner_from_history(history_values, master)
+    )
+    result['Diag_Inner_Unit'] = (
+        inner if inner is not None else np.nan
+    )
+    result['Diag_Inner_Count'] = inner_count
+    result['Diag_Inner_Ratio'] = inner_ratio
+
+    # Base
+    base, has_base = infer_base_unit(history_values, inner)
+    result['Diag_Base_Unit'] = base
+
+    if inner is not None and has_base:
+        result['Diag_Tier_Structure'] = (
+            f'3-Tier [Master:{_fmt_num(master)} | '
+            f'Inner:{_fmt_num(inner)} | Base:1]'
+        )
+    elif master is not None:
+        result['Diag_Tier_Structure'] = (
+            f'2-Tier [Master:{_fmt_num(master)} | Base:1]'
+        )
+    else:
+        result['Diag_Tier_Structure'] = 'Unknown Tier Structure'
+
+    # Duplicate
+    duplicate, duplicate_count = (
+        detect_duplicate_imports(product_history)
+    )
+    result['Diag_Duplicate'] = duplicate
+
+    # Missing Import Reconciliation
+    missing_result = diagnose_missing_import(
+        product_history, inner=inner, master=master
+    )
+    result['Diag_Max_Negative_Qty'] = missing_result['max_negative_qty']
+    result['Diag_Suggested_Missing_Unit_Qty'] = missing_result['suggested_pack_qty']
+    result['Diag_Suggested_Missing_Base_Qty'] = missing_result['suggested_base_qty']
+    result['Diag_Missing_History_Match'] = missing_result['matched_history']
+
+    # ---- Missing Import Bill มี priority สูง ----
+    if bool(row['is_missing_inbound_bill']):
+        if (
+            missing_result['max_negative_qty'] > 0
+            and missing_result['matched_history']
+        ):
+            result['Diag_Root_Cause'] = (
+                '🔴 Unrecorded Import: '
+                'สงสัยลืมคีย์บิลรับเข้า '
+                f"({missing_result['matched_unit']} "
+                f"{missing_result['suggested_pack_qty']} หน่วย)"
+            )
+            result['Diag_Confidence'] = 'High'
+            result['Diag_Evidence'] = (
+                'พบช่วง Inbound Gap (Window Rolling 5 ครั้ง) + Stock ติดลบสูงสุด '
+                '+ จำนวนที่คำนวณย้อนกลับตรงกับประวัติรับเข้า (คำนวณจาก Ceil)'
+            )
+            return result
+
+        result['Diag_Root_Cause'] = (
+            '🔴 Unrecorded Import: '
+            'สงสัยลืมคีย์บิลรับเข้า'
+        )
+        result['Diag_Confidence'] = 'Medium'
+        result['Diag_Evidence'] = (
+            'พบ Inbound Gap (Window Rolling) + มีการเคลื่อนไหวขายอย่างต่อเนื่อง '
+            'แต่ยังไม่พบหลักฐานยืนยันจำนวนรับเข้าที่แน่นอน (Unrecorded Import)'
+        )
+        return result
+
+    # ---- Duplicate Entry ----
+    if duplicate:
+        result['Diag_Root_Cause'] = (
+            '🟠 Duplicate Import Entry: '
+            'สงสัยบันทึกรับเข้าซ้ำ'
+        )
+        result['Diag_Confidence'] = 'High'
+        result['Diag_Evidence'] = (
+            f'พบรูปแบบบิลรับเข้าซ้ำ/ยอดซ้ำ '
+            f'จำนวน {duplicate_count} รายการ'
+        )
+        return result
+
+    # ---- ถ้าไม่ใช่ Outlier Import → ไม่ทำ Barcode Hypothesis ----
+    if not bool(row['is_outlier_import']):
+        if bool(row['is_stock_out']):
+            result['Diag_Root_Cause'] = (
+                '🛑 Stock Out: '
+                'ต้องตรวจสอบบิลรับเข้าที่ขาดหายหรือยอดขาย'
+            )
+            result['Diag_Confidence'] = 'Medium'
+            result['Diag_Evidence'] = (
+                'ยอด Balance <= 0 ขณะที่มี Export '
+                '(อาจเกิดจากการลืมคีย์รับเข้าก่อนหน้า)'
+            )
+
+        elif bool(row['is_balance_tampered']):
+            result['Diag_Root_Cause'] = (
+                '🚨 Balance Mismatch: '
+                'สงสัยยอดคงเหลือถูกแก้ไข/ไม่ตรง Flow'
+            )
+            result['Diag_Confidence'] = 'Medium'
+            result['Diag_Evidence'] = (
+                'Balance ไม่ตรงกับ Running Net Flow '
+                '(ยอดที่คำนวณย้อนกลับไม่ตรงกับที่แสดง)'
+            )
+
+        return result
+
+    # ---- Multi-Hypothesis ----
+    candidates = build_candidate_matrix(
+        observed_import=observed,
+        master=master,
+        inner=inner,
+        history_values=history_values,
+        ewma_prediction=row.get('Expected_Import')
+    )
+
+    # 💡 Simulation: Zero End Balance (ลองหักลบยอดให้ Balance เป็น 0)
+    inferred = row.get('inferred_import', np.nan)
+    period_end_bal = row.get('period_end_balance', 0)
+    if pd.notna(inferred) and inferred > 0:
+        score, z, median, passed = candidate_robust_score(history_values, inferred)
+        
+        # ถ้ายอดที่หักลบได้ (inferred) มีโครงสร้างบาร์รับรอง เช่น ลงตัวกับ Master/Inner หรือเป็น Inner+Base (เกิน 1 แพ็ค)
+        # ให้สิทธิ์ "ชนะขาด" ทันที โดยข้ามการกรอง Z-Score เพราะพิสูจน์แล้วว่าทำให้สต็อกเป็น 0 พอดี
+        is_struct_match = False
+        if inner and inner > 1 and (inferred % inner == 0 or inferred >= inner):
+            is_struct_match = True
+        elif master and master > 1 and (inferred % master == 0 or inferred == master):
+            is_struct_match = True
+            
+        if is_struct_match:
+            passed = True
+            score = -1.0  # ใช้คะแนนติดลบ เพื่อให้ชนะ candidate อื่นๆ ในฟังก์ชัน select_best_candidate เสมอ
+            
+        candidates.append({
+            'hypothesis': 'Simulation: Zero End Balance',
+            'formula': f"Observed({observed}) - PeriodEndBal({period_end_bal})",
+            'candidate_base_qty': inferred,
+            'revalidation_score': score,
+            'revalidation_z': z,
+            'historical_median': median,
+            'revalidation_pass': passed,
+        })
+
+    best = select_best_candidate(candidates)
+
+    # ---- พบ Candidate ที่ Re-validation ผ่าน ----
+    if best is not None:
+        candidate = best['candidate_base_qty']
+
+        result['Diag_Candidate'] = candidate
+        result['Diag_Candidate_Hypothesis'] = best['hypothesis']
+        result['Diag_Candidate_Formula'] = best['formula']
+        result['Diag_Revalidation_Z'] = best['revalidation_z']
+        result['Diag_Revalidation_Score'] = best['revalidation_score']
+        result['Diag_Revalidation_Pass'] = True
+
+        breakdown = breakdown_quantity(
+            candidate, master=master, inner=inner
+        )
+        result['Diag_Breakdown'] = breakdown['text']
+
+        if 'Double Conversion' in best['hypothesis']:
+            result['Diag_Root_Cause'] = (
+                '🟠 Double Conversion / '
+                'สับสนหน่วย Inner ซ้ำ'
+            )
+        elif 'Master → Base' in best['hypothesis']:
+            result['Diag_Root_Cause'] = (
+                '🟡 Barcode Swap: '
+                'สงสัยยิงบาร์ Master/ลังผิด'
+            )
+        elif 'Inner → Base' in best['hypothesis']:
+            result['Diag_Root_Cause'] = (
+                '🟡 Barcode Swap: '
+                'สงสัยยิงบาร์ Inner/แพ็คผิด'
+            )
+        elif 'Predictive Normalization' in best['hypothesis']:
+            result['Diag_Root_Cause'] = (
+                '🟢 Mistake Entry: '
+                'ยอดนำเข้าผิดปกติ นำค่าทำนาย(EWMA)มาแทนแล้วอยู่ในเกณฑ์ปกติ'
+            )
+        elif 'Simulation: Zero End Balance' in best['hypothesis']:
+            result['Diag_Root_Cause'] = (
+                '🟢 Reconciliation Match: '
+                'คำนวณย้อนกลับพบยอดที่ทำให้สต็อกเหลือ 0 พอดี และสอดคล้องกับโครงสร้างบาร์'
+            )
+        else:
+            result['Diag_Root_Cause'] = (
+                '🟢 Import Outlier: '
+                'พบ Candidate ที่กลับมาอยู่ใน '
+                'Historical Pattern'
+            )
+
+        if best['revalidation_score'] <= 1.5:
+            result['Diag_Confidence'] = 'High'
+        else:
+            result['Diag_Confidence'] = 'Medium'
+
+        result['Diag_Evidence'] = (
+            f"Observed={_fmt_num(observed)} | "
+            f"Master={_fmt_num(master)} | "
+            f"Inner={_fmt_num(inner)} | "
+            f"Candidate={_fmt_num(candidate)} | "
+            f"Robust Z-Score={best['revalidation_z']:.2f} "
+            f"(ผ่านเกณฑ์ < 2.5) | "
+            f"Breakdown={breakdown['text']}"
+        )
+
+        return result
+
+    # ---- ไม่มี Candidate ผ่าน ----
+    master_divisible = (
+        master is not None
+        and master > 1
+        and np.isclose(observed % master, 0)
+    )
+
+    inner_divisible = (
+        inner is not None
+        and inner > 1
+        and np.isclose(observed % inner, 0)
+    )
+
+    if not master_divisible and not inner_divisible:
+        result['Diag_Root_Cause'] = (
+            '🔴 Typo / Key-in Error: '
+            'ยอดไม่ตรงโครงสร้าง Master/Inner '
+            'และ Re-validation ไม่ผ่าน'
+        )
+        result['Diag_Confidence'] = 'Medium'
+        result['Diag_Evidence'] = (
+            f"Observed={_fmt_num(observed)} | "
+            f"Master={_fmt_num(master)} | "
+            f"Inner={_fmt_num(inner)} | "
+            'หาร Master/Inner ไม่ลงตัว '
+            '+ Candidate ไม่ผ่าน Historical Boundary'
+        )
+    else:
+        result['Diag_Root_Cause'] = (
+            '🟣 Unresolved Import Outlier: '
+            'อาจเกิดจากข้อผิดพลาดสะสมหลายเหตุการณ์ (Cumulative Errors) ทำให้ระบุยอดที่แน่นอนไม่ได้'
+        )
+        result['Diag_Confidence'] = 'Low'
+        result['Diag_Evidence'] = (
+            'มี Candidate ที่หารลงตัว หรือมีค่าย้อนกลับ '
+            'แต่การตรวจสอบ (Re-validation) ไม่ผ่านเกณฑ์ปกติ'
+        )
+
+    return result
+
+
+# ============================================================
+# 9.13 Run Diagnosis เฉพาะ Anomaly
+# ============================================================
+diag_columns = [
+    'Diag_Is_Checked',
+    'Diag_Root_Cause',
+    'Diag_Confidence',
+    'Diag_Master_Unit',
+    'Diag_Inner_Unit',
+    'Diag_Base_Unit',
+    'Diag_Tier_Structure',
+    'Diag_Inner_Count',
+    'Diag_Inner_Ratio',
+    'Diag_Candidate',
+    'Diag_Candidate_Hypothesis',
+    'Diag_Candidate_Formula',
+    'Diag_Revalidation_Z',
+    'Diag_Revalidation_Score',
+    'Diag_Revalidation_Pass',
+    'Diag_Breakdown',
+    'Diag_Max_Negative_Qty',
+    'Diag_Suggested_Missing_Unit_Qty',
+    'Diag_Suggested_Missing_Base_Qty',
+    'Diag_Missing_History_Match',
+    'Diag_Duplicate',
+    'Diag_Evidence',
+]
+
+for col in diag_columns:
+    if col in [
+        'Diag_Is_Checked',
+        'Diag_Revalidation_Pass',
+        'Diag_Duplicate',
+        'Diag_Missing_History_Match',
+    ]:
+        df[col] = False
+    elif col in [
+        'Diag_Root_Cause',
+        'Diag_Confidence',
+        'Diag_Tier_Structure',
+        'Diag_Candidate_Hypothesis',
+        'Diag_Candidate_Formula',
+        'Diag_Breakdown',
+        'Diag_Evidence',
+    ]:
+        df[col] = None
+    else:
+        df[col] = np.nan
+
+
+# ============================================================
+# 9.14 Apply Diagnosis
+# ============================================================
+for idx, row in df.iterrows():
+
+    if not (
+        bool(row['is_outlier_import'])
+        or bool(row['is_missing_inbound_bill'])
+        or bool(row['is_stock_out'])
+        or bool(row['is_balance_tampered'])
+        or bool(row['is_ghost_stock'])
+        or bool(row['is_dead_last_item'])
+    ):
+        continue
+
+    product_history = df[
+        df['product_id'] == row['product_id']
+    ].copy()
+
+    diagnosis = diagnose_row(row, product_history)
+
+    for col in diag_columns:
+        df.at[idx, col] = diagnosis[col]
+
+
+# ============================================================
+# 10. Final Classification
+# ============================================================
+def build_final_diagnosis(row):
+    root = row.get('Diag_Root_Cause')
+
+    if root is None or pd.isna(root):
+        return row['Anomaly_Type']
+
+    if not row.get('Diag_Is_Checked', False):
+        return row['Anomaly_Type']
+
+    return root
+
+
+df['Final_Diagnosis'] = df.apply(
+    build_final_diagnosis,
+    axis=1
+)
+
+
+# ============================================================
+# 11. Diagnostic Summary Columns
+# ============================================================
+df['Diag_Master_Unit'] = pd.to_numeric(
+    df['Diag_Master_Unit'], errors='coerce'
+)
+df['Diag_Inner_Unit'] = pd.to_numeric(
+    df['Diag_Inner_Unit'], errors='coerce'
+)
+df['Diag_Candidate'] = pd.to_numeric(
+    df['Diag_Candidate'], errors='coerce'
+)
+df['Diag_Revalidation_Z'] = pd.to_numeric(
+    df['Diag_Revalidation_Z'], errors='coerce'
+)
+df['Diag_Revalidation_Score'] = pd.to_numeric(
+    df['Diag_Revalidation_Score'], errors='coerce'
+)
+
+
+# ============================================================
+# 11.1 ★ Expected_Import: ใช้ Diag_Candidate แทนค่าเดิม ★
+#      (แก้ไขจุดที่ 2 ส่วนที่ 2: Diagnosis overwrite)
+#
+#      ลำดับ Priority:
+#      1. Diag_Candidate ที่ Re-validation ผ่าน → ใช้แทน
+#      2. คง EWMA prediction ไว้ (จาก Section 3.1)
+#      3. ถ้า import ปกติ → import เดิม
+# ============================================================
+diag_candidate_mask = (
+    (df['Diag_Revalidation_Pass'] == True)
+    & (df['Diag_Candidate'].notna())
+    & (df['Diag_Candidate'] > 0)
+)
+
+df.loc[diag_candidate_mask, 'Expected_Import'] = (
+    df.loc[diag_candidate_mask, 'Diag_Candidate']
+)
+
+# อัปเดต Diff_Import ตาม Expected_Import ใหม่
+df['Diff_Import'] = np.where(
+    df['import'] > 0,
+    df['import'] - df['Expected_Import'],
+    np.nan
+)
+
+
+# ============================================================
+# 12. ★ Focus_Columns ★
+#     (แก้ไขจุดที่ 3: บอกว่าแต่ละ Anomaly ควรดูคอลัมน์ไหน)
+# ============================================================
+focus_conditions = [
+    (df['is_outlier_import'] == True),
+    (df['is_missing_inbound_bill'] == True),
+    (df['is_ghost_stock'] == True),
+    (df['is_stock_out'] == True),
+    (df['is_balance_tampered'] == True),
+    (df['is_dead_last_item'] == True),
+]
+
+focus_labels = [
+    'import, Expected_Import, Diff_Import, Diag_Candidate, Diag_Breakdown',
+    'suspected_missing_period, estimated_missing_qty, Diag_Suggested_Missing_Base_Qty',
+    'days_idle, balances, adjusted_calc_balance',
+    'balances, export, import',
+    'balances, adjusted_calc_balance, net_flow',
+    'days_idle, balances, median_inter_sale_days',
+]
+
+df['Focus_Columns'] = np.select(
+    focus_conditions,
+    focus_labels,
+    default=''
+)
+
+
+# ============================================================
+# 13. ★ Anomaly_Evidence ★
+#     (แก้ไขจุดที่ 4: บิล/ลืมคีย์ต้องมีเหตุผลรับรอง)
+#
+#     เชื่อมโยง Diag_Evidence จาก Diagnosis layer
+#     กลับมายัง Detection layer เพื่อให้ทุก anomaly มีเหตุผล
+# ============================================================
+df['Anomaly_Evidence'] = np.where(
+    df['Diag_Is_Checked'] == True,
+    df['Diag_Evidence'].fillna('Diagnosis completed — no specific evidence'),
+    np.where(
+        df['Anomaly_Type'] != '⚪ ปกติ (Normal)',
+        'Detection flag only — pending diagnosis',
+        ''
+    )
+)
+
+
+# ============================================================
+# 14. Result
+# ============================================================
+# df คือ DataFrame ผลลัพธ์สุดท้าย
+#
+# คอลัมน์เดิมยังอยู่ครบ เช่น:
+# Expected_Import        ← ★ ใช้ EWMA + Diag_Candidate (ไม่ใช่ median)
+# Diff_Import
+# ZScore_Import          ← ★ คำนวณจากเฉพาะ Bill IB/IBK/DM
+# is_outlier_import      ← ★ กรอง valid bill ก่อน
+# is_valid_import_bill   ← ★ flag ว่า bill ขึ้นต้นด้วย IB/IBK/DM
+# is_suspected_ghost
+# is_dead_last_item
+# is_missing_inbound_bill
+# estimated_missing_qty
+# adjusted_import
+# adjusted_calc_balance
+# is_balance_tampered
+# is_stock_out
+# Anomaly_Type
+#
+# และเพิ่ม Diagnosis:
+# Diag_Master_Unit
+# Diag_Inner_Unit
+# Diag_Base_Unit
+# Diag_Tier_Structure
+# Diag_Candidate
+# Diag_Candidate_Hypothesis
+# Diag_Revalidation_Z
+# Diag_Revalidation_Pass
+# Diag_Breakdown
+# Diag_Max_Negative_Qty
+# Diag_Suggested_Missing_Base_Qty
+# Diag_Missing_History_Match
+# Diag_Duplicate
+# Diag_Root_Cause
+# Diag_Confidence
+# Diag_Evidence
+# Final_Diagnosis
+#
+# ★ คอลัมน์ใหม่:
+# Focus_Columns          ← บอกคอลัมน์ที่ต้องดูตาม Anomaly
+# Anomaly_Evidence       ← เหตุผลรับรองจาก Diagnosis
+#
+# ============================================================
+# 15. เลือกเฉพาะคอลัมน์ที่จำเป็น (Filter Necessary Columns)
+# ============================================================
+necessary_columns = [
+    'DATE',
+    'product_id',
+    'Bill',
+    'details',
+    'import',
+    'export',
+    'balances',
+    'Expected_Import',
+    'Diff_Import',
+    'ZScore_Import',
+    'is_outlier_import',
+    'Anomaly_Type',
+    'Final_Diagnosis',
+    'Diag_Root_Cause',
+    'Anomaly_Evidence',
+    'Focus_Columns'
+]
+df = df[[c for c in necessary_columns if c in df.columns]]
+
+# ============================================================
+# จบ Pipeline
+# ============================================================
