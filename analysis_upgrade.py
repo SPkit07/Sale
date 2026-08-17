@@ -23,6 +23,29 @@ import openpyxl
 import pandas as pd
 
 
+def _round_positive_qty(value):
+    """Return a positive whole-item quantity, or None if the value is unusable."""
+    try:
+        if pd.isna(value):
+            return None
+
+        value = float(value)
+        if not np.isfinite(value) or value <= 0:
+            return None
+
+        return int(math.floor(value + 0.5))
+    except Exception:
+        return None
+
+
+def _round_positive_qty_series(values):
+    numeric = pd.to_numeric(values, errors='coerce')
+    result = pd.Series(np.nan, index=numeric.index, dtype=float)
+    valid = numeric.notna() & np.isfinite(numeric) & (numeric > 0)
+    result.loc[valid] = np.floor(numeric.loc[valid] + 0.5)
+    return result
+
+
 # ============================================================
 # 1. เตรียมและทำความสะอาดข้อมูล
 # ============================================================
@@ -93,11 +116,8 @@ def compute_robust_iqr_zscore_import_fast(df_filtered, col='import'):
 bill_upper = df['Bill'].fillna('').astype(str).str.upper().str.strip()
 df['is_valid_import_bill'] = bill_upper.str.startswith(('IB', 'IBK', 'DM'))
 
-# กรองเฉพาะ Import > 0 ที่ Bill ขึ้นต้นด้วย IB / IBK / DM
-df_imp = df[
-    (df['import'] > 0)
-    & (df['is_valid_import_bill'])
-].copy()
+# กรองเฉพาะ Import > 0 (ดึงมาคำนวณทั้งหมดเพื่อไม่ให้มีปัญหา row ที่ไม่ได้คำนวณ)
+df_imp = df[df['import'] > 0].copy()
 
 df['Expected_Import'] = np.nan
 df['Diff_Import'] = np.nan
@@ -126,36 +146,34 @@ if not df_imp.empty:
 #     ให้น้ำหนักบิลรับเข้าล่าสุดมากกว่าบิลเก่า
 #     span=5 เป็น default parameter (ปรับได้)
 # ============================================================
-def ewma_predict_per_sku(group):
-    """
-    คำนวณ EWMA prediction ต่อ SKU แบบ Dynamic (Span ตามปริมาณบิลของแต่ละรายการ)
-    ใช้เฉพาะ valid import bills (IB/IBK/DM) ที่ import > 0
-    """
-    valid_mask = (group['import'] > 0) & (group['is_valid_import_bill'])
-    valid = group.loc[valid_mask, 'import']
+df['_ewma_expected'] = np.nan
+valid_mask = df['import'] > 0
+valid_df = df.loc[valid_mask, ['product_id', 'import']].copy()
 
-    result = pd.Series(np.nan, index=group.index)
+if not valid_df.empty:
+    # นับจำนวนบิลต่อ SKU
+    valid_counts = valid_df.groupby('product_id')['import'].transform('count')
+    
+    # คำนวณ dynamic_span (3 ถึง 10)
+    valid_df['dynamic_span'] = np.clip(valid_counts // 2, 3, 10)
+    
+    # คำนวณ EWMA แยกตาม span (วนลูปแค่ 8 รอบ แทนที่จะวนลูปตามจำนวน SKU)
+    ewma_results = []
+    for span_val in range(3, 11):
+        span_subset = valid_df[valid_df['dynamic_span'] == span_val]
+        if span_subset.empty:
+            continue
+            
+        span_ewma = span_subset.groupby('product_id')['import'].ewm(span=span_val, min_periods=1).mean()
+        span_ewma = span_ewma.reset_index(level=0, drop=True)
+        ewma_results.append(span_ewma)
+        
+    if ewma_results:
+        all_ewma = pd.concat(ewma_results)
+        df.loc[all_ewma.index, '_ewma_expected'] = all_ewma
 
-    if valid.empty:
-        return result
-
-    # Dynamic Span: อิงตามจำนวนบิลรับเข้าที่มีของแต่ละ SKU (3 ถึง 10)
-    dynamic_span = max(3, min(10, len(valid) // 2))
-
-    # EWMA ของประวัติรับเข้าจริง
-    ewma_vals = valid.ewm(span=dynamic_span, min_periods=1).mean()
-    result.loc[valid.index] = ewma_vals
-
-    # กระจายค่า prediction ไปยังแถวอื่นด้วย forward-fill + back-fill
-    result = result.ffill().bfill()
-
-    return result
-
-# คำนวณ EWMA prediction ต่อ SKU
-df['_ewma_expected'] = (
-    df.groupby('product_id', group_keys=False)
-    .apply(ewma_predict_per_sku)
-)
+# กระจายค่า prediction ไปยังแถวอื่นใน SKU เดียวกันด้วย forward-fill + back-fill
+df['_ewma_expected'] = df.groupby('product_id')['_ewma_expected'].ffill().bfill()
 
 # Expected_Import เบื้องต้น: ถ้ามี import > 0 ใช้ EWMA prediction
 # ถ้า import == 0 ใส่ NaN (ไม่ใช่ anomaly ส่วนนี้)
@@ -173,19 +191,7 @@ df['Diff_Import'] = np.where(
 
 df.drop(columns=['_ewma_expected'], inplace=True, errors='ignore')
 
-# ============================================================
-# สำหรับแถวที่ import > 0 แต่ไม่ใช่ valid bill → Expected = import เดิม
-# (ไม่ถูกกรองเป็น outlier แต่ยังคง Expected ไว้เพื่อความครบถ้วน)
-# ============================================================
-non_valid_import_mask = (
-    (df['import'] > 0)
-    & (~df['is_valid_import_bill'])
-    & (df['Expected_Import'].isna())
-)
-df.loc[non_valid_import_mask, 'Expected_Import'] = (
-    df.loc[non_valid_import_mask, 'import']
-)
-df.loc[non_valid_import_mask, 'Diff_Import'] = 0
+
 
 
 # ============================================================
@@ -382,38 +388,6 @@ df.drop(
 # ============================================================
 df['net_flow'] = df['import'] - df['export']
 
-# ใช้ Balance บรรทัดสุดท้ายของสินค้านั้นๆ เป็นตัวตั้งคำนวณย้อนกลับ
-df['period_end_balance'] = df.groupby('product_id')['balances'].transform('last')
-
-df['inferred_import'] = df['import'] - df['period_end_balance']
-
-# Reverse Reconciliation: คำนวณทุกแถวที่ import > 0
-# ถ้ายอดรับเข้ามากกว่าสต็อกปลายทาง → มีส่วนเกินที่น่าสงสัย
-reverse_mask = (df['import'] > 0) & (df['import'] > df['period_end_balance'])
-
-df['adjusted_import'] = np.where(
-    reverse_mask,
-    df['inferred_import'],
-    df['import'],
-)
-
-# ★ Expected_Import ปรับจาก Reverse Reconciliation (ทุกบิลที่ import > end_balance) ★
-df['Expected_Import'] = np.where(
-    reverse_mask,
-    df['inferred_import'],
-    df['Expected_Import'],
-)
-
-df['Diff_Import'] = np.where(
-    df['import'] > 0,
-    df['import'] - df['Expected_Import'],
-    np.nan
-)
-
-df['adjusted_net_flow'] = (
-    df['adjusted_import'] - df['export']
-)
-
 first_balance_actual = (
     df.groupby('product_id')['balances'].transform('first')
 )
@@ -426,6 +400,79 @@ true_initial_balance = (
     first_balance_actual - first_net_flow_actual
 )
 
+calc_running_balance = (
+    true_initial_balance
+    + df.groupby('product_id')['net_flow'].cumsum()
+)
+
+df['calc_balance_before_row'] = calc_running_balance - df['net_flow']
+
+# ใช้ Balance บรรทัดสุดท้ายของสินค้านั้นๆ เป็นตัวตั้งคำนวณย้อนกลับ
+df['period_end_balance'] = df.groupby('product_id')['balances'].transform('last')
+
+df['inferred_import'] = _round_positive_qty_series(
+    df['import'] - df['period_end_balance']
+)
+
+# Simulation เฉพาะวัน: ลองแทนยอดรับเข้าใหม่จน balance หลังหัก export ของวันนั้นเป็น 0
+# เช่น balance ก่อนวันนั้น 1, import 25, export 7 → expected import = 7 - 1 = 6
+df['zero_stock_expected_import'] = _round_positive_qty_series(
+    df['export'] - df['calc_balance_before_row']
+)
+
+df['zero_stock_simulated_balance'] = (
+    df['calc_balance_before_row']
+    + df['zero_stock_expected_import']
+    - df['export']
+)
+
+zero_stock_reverse_mask = (
+    (df['hypothesis_zero_stock'] | df['is_outlier_import'])
+    & (df['import'] > 0)
+    & (df['balances'] > 0)
+    & df['zero_stock_expected_import'].notna()
+    & (df['zero_stock_expected_import'] < df['import'])
+    & np.isclose(df['zero_stock_simulated_balance'], 0)
+)
+
+# Reverse Reconciliation: คำนวณเฉพาะแถวที่เป็น Outlier
+# ถ้ายอดรับเข้ามากกว่าสต็อกปลายทาง → มีส่วนเกินที่น่าสงสัย
+period_end_reverse_mask = (
+    (df['is_outlier_import'] == True)
+    & (df['import'] > df['period_end_balance'])
+    & df['inferred_import'].notna()
+    & (df['inferred_import'] < df['import'])
+)
+
+reverse_mask = zero_stock_reverse_mask | period_end_reverse_mask
+
+df['adjusted_import'] = df['import']
+df.loc[period_end_reverse_mask, 'adjusted_import'] = (
+    df.loc[period_end_reverse_mask, 'inferred_import']
+)
+df.loc[zero_stock_reverse_mask, 'adjusted_import'] = (
+    df.loc[zero_stock_reverse_mask, 'zero_stock_expected_import']
+)
+
+# ★ Expected_Import ปรับจาก Reverse Reconciliation ★
+# ให้ Zero-Stock Simulation มี priority เหนือสูตรปลายงวด
+df.loc[period_end_reverse_mask, 'Expected_Import'] = (
+    df.loc[period_end_reverse_mask, 'inferred_import']
+)
+df.loc[zero_stock_reverse_mask, 'Expected_Import'] = (
+    df.loc[zero_stock_reverse_mask, 'zero_stock_expected_import']
+)
+
+df['Diff_Import'] = np.where(
+    df['import'] > 0,
+    df['import'] - df['Expected_Import'],
+    np.nan
+)
+
+df['adjusted_net_flow'] = (
+    df['adjusted_import'] - df['export']
+)
+
 df['adjusted_calc_balance'] = (
     true_initial_balance
     + df.groupby('product_id')['adjusted_net_flow'].cumsum()
@@ -435,11 +482,6 @@ df['is_ghost_stock'] = (
     (df['is_suspected_ghost'] == True)
     & (df['adjusted_calc_balance'] <= 0)
     & (df['balances'] > 0)
-)
-
-calc_running_balance = (
-    true_initial_balance
-    + df.groupby('product_id')['net_flow'].cumsum()
 )
 
 df['is_balance_tampered'] = (
@@ -821,11 +863,9 @@ def build_candidate_matrix(
     candidates = []
 
     def add(name, formula, candidate):
+        candidate = _round_positive_qty(candidate)
+
         if candidate is None:
-            return
-        if not np.isfinite(candidate):
-            return
-        if candidate <= 0:
             return
 
         score, z, median, passed = candidate_robust_score(
@@ -882,7 +922,7 @@ def build_candidate_matrix(
     if ewma_prediction is not None and ewma_prediction > 0:
         add(
             'Predictive Normalization',
-            'EWMA Predict',
+            'round(EWMA Predict)',
             ewma_prediction
         )
 
@@ -1192,10 +1232,46 @@ def diagnose_row(row, product_history):
         ewma_prediction=row.get('Expected_Import')
     )
 
-    # 💡 Simulation: Zero End Balance (ลองหักลบยอดให้ Balance เป็น 0)
+    # 💡 Simulation: Zero Today Balance
+    # ลองแทนยอดรับเข้าใหม่จน balance หลังหัก export ของวันนั้นเป็น 0
+    zero_stock_candidate = _round_positive_qty(
+        row.get('zero_stock_expected_import', np.nan)
+    )
+    calc_balance_before = row.get('calc_balance_before_row', np.nan)
+    simulated_zero_balance = row.get('zero_stock_simulated_balance', np.nan)
+
+    if (
+        zero_stock_candidate is not None
+        and zero_stock_candidate < observed
+        and pd.notna(simulated_zero_balance)
+        and np.isclose(simulated_zero_balance, 0)
+    ):
+        score, z, median, passed = candidate_robust_score(
+            history_values, zero_stock_candidate
+        )
+
+        if bool(row.get('hypothesis_zero_stock', False)) or bool(row.get('is_ghost_stock', False)):
+            passed = True
+            score = -2.0
+
+        candidates.append({
+            'hypothesis': 'Simulation: Zero Today Balance',
+            'formula': (
+                f"Export({_fmt_num(row.get('export', np.nan))}) "
+                f"- BalanceBefore({_fmt_num(calc_balance_before)})"
+            ),
+            'candidate_base_qty': zero_stock_candidate,
+            'revalidation_score': score,
+            'revalidation_z': z,
+            'historical_median': median,
+            'revalidation_pass': passed,
+        })
+
+    # 💡 Simulation: Zero End Balance (fallback ปลายงวด)
     inferred = row.get('inferred_import', np.nan)
     period_end_bal = row.get('period_end_balance', 0)
-    if pd.notna(inferred) and inferred > 0:
+    inferred = _round_positive_qty(inferred)
+    if inferred is not None and inferred < observed:
         score, z, median, passed = candidate_robust_score(history_values, inferred)
         
         # ถ้ายอดที่หักลบได้ (inferred) มีโครงสร้างบาร์รับรอง เช่น ลงตัวกับ Master/Inner หรือเป็น Inner+Base (เกิน 1 แพ็ค)
@@ -1258,7 +1334,7 @@ def diagnose_row(row, product_history):
                 '🟢 Mistake Entry: '
                 'ยอดนำเข้าผิดปกติ นำค่าทำนาย(EWMA)มาแทนแล้วอยู่ในเกณฑ์ปกติ'
             )
-        elif 'Simulation: Zero End Balance' in best['hypothesis']:
+        elif 'Simulation: Zero' in best['hypothesis']:
             result['Diag_Root_Cause'] = (
                 '🟢 Reconciliation Match: '
                 'คำนวณย้อนกลับพบยอดที่ทำให้สต็อกเหลือ 0 พอดี และสอดคล้องกับโครงสร้างบาร์'
@@ -1381,47 +1457,40 @@ for col in diag_columns:
 # ============================================================
 # 9.14 Apply Diagnosis
 # ============================================================
-for idx, row in df.iterrows():
+anomaly_mask = (
+    df['is_outlier_import']
+    | df['is_missing_inbound_bill']
+    | df['is_stock_out']
+    | df['is_balance_tampered']
+    | df['is_ghost_stock']
+    | df['is_dead_last_item']
+)
 
-    if not (
-        bool(row['is_outlier_import'])
-        or bool(row['is_missing_inbound_bill'])
-        or bool(row['is_stock_out'])
-        or bool(row['is_balance_tampered'])
-        or bool(row['is_ghost_stock'])
-        or bool(row['is_dead_last_item'])
-    ):
-        continue
+anomaly_indices = df.index[anomaly_mask]
 
-    product_history = df[
-        df['product_id'] == row['product_id']
-    ].copy()
-
-    diagnosis = diagnose_row(row, product_history)
-
-    for col in diag_columns:
-        df.at[idx, col] = diagnosis[col]
+if len(anomaly_indices) > 0:
+    # ดึงเฉพาะ product_id ที่มีปัญหามาสร้างประวัติ เพื่อลดการใช้ Memory และเวลา
+    anomaly_pids = df.loc[anomaly_indices, 'product_id'].unique()
+    
+    # สร้าง Dictionary เก็บประวัติของสินค้าแต่ละตัวไว้ล่วงหน้า (O(1) lookup time)
+    # เฉพาะรายการที่มีปัญหาเท่านั้น เพื่อลดการ Scan ตารางใหม่ทุกรอบในลูป
+    relevant_history = df[df['product_id'].isin(anomaly_pids)]
+    history_dict = {pid: group for pid, group in relevant_history.groupby('product_id')}
+    
+    for idx in anomaly_indices:
+        row = df.loc[idx]
+        product_history = history_dict[row['product_id']].copy()
+        diagnosis = diagnose_row(row, product_history)
+        
+        for col in diag_columns:
+            df.at[idx, col] = diagnosis[col]
 
 
 # ============================================================
 # 10. Final Classification
 # ============================================================
-def build_final_diagnosis(row):
-    root = row.get('Diag_Root_Cause')
-
-    if root is None or pd.isna(root):
-        return row['Anomaly_Type']
-
-    if not row.get('Diag_Is_Checked', False):
-        return row['Anomaly_Type']
-
-    return root
-
-
-df['Final_Diagnosis'] = df.apply(
-    build_final_diagnosis,
-    axis=1
-)
+mask_has_diag = df['Diag_Root_Cause'].notna() & (df['Diag_Is_Checked'] == True)
+df['Final_Diagnosis'] = np.where(mask_has_diag, df['Diag_Root_Cause'], df['Anomaly_Type'])
 
 
 # ============================================================
@@ -1463,12 +1532,21 @@ df.loc[diag_candidate_mask, 'Expected_Import'] = (
     df.loc[diag_candidate_mask, 'Diag_Candidate']
 )
 
+# จำนวนสินค้าเป็นหน่วยเต็ม: กันไม่ให้ค่า EWMA ทศนิยมหลุดเป็นคำตอบสุดท้าย
+qty_mask = (df['import'] > 0) & df['Expected_Import'].notna()
+df.loc[qty_mask, 'Expected_Import'] = _round_positive_qty_series(
+    df.loc[qty_mask, 'Expected_Import']
+)
+
 # อัปเดต Diff_Import ตาม Expected_Import ใหม่
 df['Diff_Import'] = np.where(
     df['import'] > 0,
     df['import'] - df['Expected_Import'],
     np.nan
 )
+
+diff_mask = df['Diff_Import'].notna()
+df.loc[diff_mask, 'Diff_Import'] = np.round(df.loc[diff_mask, 'Diff_Import'])
 
 
 # ============================================================
@@ -1519,6 +1597,76 @@ df['Anomaly_Evidence'] = np.where(
 
 
 # ============================================================
+# 13.1 Trace Back To Suspected Bill
+# ============================================================
+trace_mask = (
+    (df['Diag_Is_Checked'] == True)
+    | (df['Anomaly_Type'] != '⚪ ปกติ (Normal)')
+)
+
+df['Trace_Back_Date'] = np.where(
+    trace_mask,
+    df['DATE'].dt.strftime('%Y-%m-%d'),
+    ''
+)
+
+df['Trace_Back_Bill'] = np.where(trace_mask, df['Bill'], '')
+
+df['Trace_Hypothesis'] = np.where(
+    df['Diag_Candidate_Hypothesis'].notna(),
+    df['Diag_Candidate_Hypothesis'],
+    np.where(trace_mask, df['Final_Diagnosis'], None)
+)
+
+df['Trace_Formula'] = np.where(
+    df['Diag_Candidate_Formula'].notna(),
+    df['Diag_Candidate_Formula'],
+    np.where(trace_mask, df['Anomaly_Evidence'], None)
+)
+
+df['Trace_Candidate_Import'] = np.where(
+    df['Diag_Candidate'].notna(),
+    df['Diag_Candidate'],
+    np.where(
+        trace_mask & df['Expected_Import'].notna(),
+        df['Expected_Import'],
+        np.nan
+    )
+)
+
+
+# ============================================================
+# 13.2 Quantity Output Types
+# ============================================================
+quantity_output_cols = [
+    'Expected_Import',
+    'Diff_Import',
+    'estimated_missing_qty',
+    'adjusted_import',
+    'adjusted_calc_balance',
+    'net_flow',
+    'calc_balance_before_row',
+    'period_end_balance',
+    'inferred_import',
+    'zero_stock_expected_import',
+    'zero_stock_simulated_balance',
+    'Diag_Candidate',
+    'Diag_Max_Negative_Qty',
+    'Diag_Suggested_Missing_Unit_Qty',
+    'Diag_Suggested_Missing_Base_Qty',
+    'Trace_Candidate_Import',
+]
+
+for qty_col in quantity_output_cols:
+    if qty_col in df.columns:
+        df[qty_col] = (
+            pd.to_numeric(df[qty_col], errors='coerce')
+            .round()
+            .astype('Int64')
+        )
+
+
+# ============================================================
 # 14. Result
 # ============================================================
 # df คือ DataFrame ผลลัพธ์สุดท้าย
@@ -1561,6 +1709,11 @@ df['Anomaly_Evidence'] = np.where(
 # ★ คอลัมน์ใหม่:
 # Focus_Columns          ← บอกคอลัมน์ที่ต้องดูตาม Anomaly
 # Anomaly_Evidence       ← เหตุผลรับรองจาก Diagnosis
+# Trace_Back_Date        ← วันที่ของแถว/บิลที่ต้องย้อนกลับไปตรวจ
+# Trace_Back_Bill        ← เลขบิลที่ต้องย้อนกลับไปตรวจ
+# Trace_Hypothesis       ← สมมติฐานที่ใช้ชี้บิลผิด
+# Trace_Formula          ← สูตร/เหตุผลที่ทำให้ย้อนกลับได้
+# Trace_Candidate_Import ← ยอดรับเข้าที่ควรเป็นหลังย้อนกลับ
 #
 # ============================================================
 # 15. เลือกเฉพาะคอลัมน์ที่จำเป็น (Filter Necessary Columns)
@@ -1575,11 +1728,40 @@ necessary_columns = [
     'balances',
     'Expected_Import',
     'Diff_Import',
+    'Trace_Back_Date',
+    'Trace_Back_Bill',
+    'Trace_Hypothesis',
+    'Trace_Formula',
+    'Trace_Candidate_Import',
     'ZScore_Import',
     'is_outlier_import',
+    'is_missing_inbound_bill',
+    'is_ghost_stock',
+    'is_dead_last_item',
+    'is_stock_out',
+    'is_balance_tampered',
+    'suspected_missing_period',
+    'estimated_missing_qty',
+    'adjusted_import',
+    'adjusted_calc_balance',
+    'net_flow',
+    'calc_balance_before_row',
+    'period_end_balance',
+    'inferred_import',
+    'zero_stock_expected_import',
     'Anomaly_Type',
     'Final_Diagnosis',
     'Diag_Root_Cause',
+    'Diag_Candidate',
+    'Diag_Candidate_Hypothesis',
+    'Diag_Candidate_Formula',
+    'Diag_Revalidation_Z',
+    'Diag_Revalidation_Pass',
+    'Diag_Breakdown',
+    'Diag_Max_Negative_Qty',
+    'Diag_Suggested_Missing_Base_Qty',
+    'Diag_Missing_History_Match',
+    'Diag_Duplicate',
     'Anomaly_Evidence',
     'Focus_Columns'
 ]
