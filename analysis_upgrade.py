@@ -1224,10 +1224,14 @@ def diagnose_row(row, product_history):
 
     result['Diag_Is_Checked'] = True
 
-    # Master
-    master, master_count, master_ratio, master_status = (
-        infer_master_unit(history_values)
-    )
+    # Master (หยิบจาก df['unit'] ตามคำแนะนำ)
+    try:
+        master = int(float(row.get('unit', 1)))
+        if master <= 1:
+            master, _, _, _ = infer_master_unit(history_values)
+    except:
+        master, _, _, _ = infer_master_unit(history_values)
+        
     result['Diag_Master_Unit'] = (
         master if master is not None else np.nan
     )
@@ -1392,22 +1396,48 @@ def diagnose_row(row, product_history):
     inferred = _round_positive_qty(inferred)
     if inferred is not None and inferred < observed:
         score, z, median, passed = candidate_robust_score(history_values, inferred)
-        
-        # ถ้ายอดที่หักลบได้ (inferred) มีโครงสร้างบาร์รับรอง เช่น ลงตัวกับ Master/Inner หรือเป็น Inner+Base (เกิน 1 แพ็ค)
-        # ให้สิทธิ์ "ชนะขาด" ทันที โดยข้ามการกรอง Z-Score เพราะพิสูจน์แล้วว่าทำให้สต็อกเป็น 0 พอดี
+        # วิเคราะห์จำนวนที่แท้จริง (inferred) ว่าตรงกับโครงสร้างอะไร (ตาม User แนะนำ)
+        hypothesis_text = 'Simulation: Zero End Balance'
         is_struct_match = False
-        if inner and inner > 1 and (inferred % inner == 0 or inferred >= inner):
-            is_struct_match = True
-        elif master and master > 1 and (inferred % master == 0 or inferred == master):
-            is_struct_match = True
+        
+        # พยายามอนุมาน Inner pack จาก inferred ถ้ายังไม่มี
+        inferred_inner = inner
+        if not inferred_inner or inferred_inner <= 1:
+            if master and master > 1:
+                if master % inferred == 0 and inferred > 1:
+                    inferred_inner = inferred
+                elif (inferred - 1) > 1 and master % (inferred - 1) == 0:
+                    inferred_inner = inferred - 1
+                    
+        if inferred_inner and inferred_inner > 1:
+            if inferred == inferred_inner:
+                is_struct_match = True
+                hypothesis_text = f'True Qty {inferred} = 1 Inner Pack (พิมพ์ผิดจาก Master {master})'
+            elif inferred % inferred_inner == 0:
+                is_struct_match = True
+                hypothesis_text = f'True Qty {inferred} = {int(inferred / inferred_inner)} Inner Pack'
+            elif (inferred - 1) > 0 and (inferred - 1) % inferred_inner == 0:
+                is_struct_match = True
+                hypothesis_text = f'True Qty {inferred} = {int((inferred - 1) / inferred_inner)} Inner Pack + 1 Base'
+                
+        if not is_struct_match and master and master > 1:
+            if inferred == master:
+                is_struct_match = True
+                hypothesis_text = f'True Qty {inferred} = 1 Master Pack'
+            elif inferred % master == 0:
+                is_struct_match = True
+                hypothesis_text = f'True Qty {inferred} = {int(inferred / master)} Master Pack'
+                
+        is_stagnant_end = bool(row.get('sku_has_stagnant_end', False))
+        is_max_imp = bool(row.get('is_max_import', False))
             
-        if is_struct_match:
+        if is_struct_match or (is_stagnant_end and is_max_imp):
             passed = True
-            score = -1.0  # ใช้คะแนนติดลบ เพื่อให้ชนะ candidate อื่นๆ ในฟังก์ชัน select_best_candidate เสมอ
+            score = -1.0  # ให้ความสำคัญสูงสุด ชนะ Candidate อื่นทั้งหมด
             
         candidates.append({
-            'hypothesis': 'Simulation: Zero End Balance',
-            'formula': f"Observed({observed}) - PeriodEndBal({period_end_bal})",
+            'hypothesis': hypothesis_text,
+            'formula': f"Observed({observed}) - PeriodEndBal({period_end_bal}) = {inferred}",
             'candidate_base_qty': inferred,
             'revalidation_score': score,
             'revalidation_z': z,
