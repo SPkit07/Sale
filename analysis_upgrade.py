@@ -23,6 +23,13 @@ import openpyxl
 import pandas as pd
 
 
+STRICT_IMPORT_BILL_PREFIXES = ('DM', 'IBK', 'IB')
+OUTLIER_Z_THRESHOLD = 3.0
+REVALIDATION_Z_THRESHOLD = 3.0
+NORMAL_CYCLE_MULTIPLIER = 1.5
+FLOAT_TOLERANCE = 1e-9
+
+
 def _round_positive_qty(value):
     """Return a positive whole-item quantity, or None if the value is unusable."""
     try:
@@ -49,17 +56,24 @@ def _round_positive_qty_series(values):
 # ============================================================
 # 1. เตรียมและทำความสะอาดข้อมูล
 # ============================================================
-df = data[
-    [
-        'DATE',
-        'Bill',
-        'details',
-        'product_id',
-        'import',
-        'export',
-        'balances',
-    ]
-].copy()
+source = data.copy()
+source.columns = source.columns.astype(str).str.strip()
+
+required_columns = [
+    'DATE',
+    'Bill',
+    'details',
+    'product_id',
+    'import',
+    'export',
+    'balances',
+]
+optional_columns = [
+    c for c in ['unit']
+    if c in source.columns
+]
+
+df = source[required_columns + optional_columns].copy()
 
 df.columns = df.columns.str.strip()
 df['product_id'] = df['product_id'].astype(str).str.strip()
@@ -67,17 +81,27 @@ df['Bill'] = df['Bill'].astype(str).str.strip()
 df['details'] = df['details'].astype(str).str.strip()
 df['DATE'] = pd.to_datetime(df['DATE'])
 
+if 'unit' not in df.columns:
+    df['unit'] = 'BASE'
+
+df['unit'] = df['unit'].astype(str).str.strip().replace('', 'BASE')
+
 for col in ['import', 'export', 'balances']:
     df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-df = df.sort_values(by=['product_id', 'DATE']).reset_index(drop=True)
+df = df.sort_values(by=['product_id', 'unit', 'DATE']).reset_index(drop=True)
+sku_group_cols = ['product_id', 'unit']
 
 
 # ============================================================
 # 2. ฟังก์ชัน Robust Z-Score (Vectorized - Logic เดิม)
 # ============================================================
 def compute_robust_iqr_zscore_import_fast(df_filtered, col='import'):
-    grouped = df_filtered.groupby('product_id')[col]
+    group_cols = ['product_id']
+    if 'unit' in df_filtered.columns:
+        group_cols.append('unit')
+
+    grouped = df_filtered.groupby(group_cols)[col]
 
     group_median = grouped.transform('median')
     group_count = grouped.transform('count')
@@ -91,7 +115,7 @@ def compute_robust_iqr_zscore_import_fast(df_filtered, col='import'):
     mad_raw = (
         (df_filtered[col] - group_median)
         .abs()
-        .groupby(df_filtered['product_id'])
+        .groupby([df_filtered[c] for c in group_cols])
         .transform('median')
     )
     mad_scaled = mad_raw * 1.4826
@@ -114,10 +138,53 @@ def compute_robust_iqr_zscore_import_fast(df_filtered, col='import'):
 #    (แก้ไขจุดที่ 1: ตัด noise จากบิลที่ไม่ใช่ Inbound จริง)
 # ============================================================
 bill_upper = df['Bill'].fillna('').astype(str).str.upper().str.strip()
-df['is_valid_import_bill'] = bill_upper.str.startswith(('IB', 'IBK', 'DM'))
+df['is_valid_import_bill'] = bill_upper.str.startswith(
+    STRICT_IMPORT_BILL_PREFIXES
+)
 
 # กรองเฉพาะ Import > 0 (ดึงมาคำนวณทั้งหมดเพื่อไม่ให้มีปัญหา row ที่ไม่ได้คำนวณ)
-df_imp = df[df['import'] > 0].copy()
+strict_import_mask = df['is_valid_import_bill'] & (df['import'] > 0)
+strict_imports = df.loc[
+    strict_import_mask,
+    ['product_id', 'unit', 'import']
+].copy()
+
+if not strict_imports.empty:
+    bar_group_cols = ['product_id', 'unit']
+    strict_imports['_total_import_volume'] = (
+        strict_imports.groupby(bar_group_cols)['import'].transform('sum')
+    )
+    strict_imports['inner_bar'] = np.ceil(
+        np.sqrt(strict_imports['_total_import_volume'])
+    ).astype(int)
+
+    valid_inner = strict_imports['inner_bar'] > 0
+    strict_imports['_basic_remainder'] = 0.0
+    strict_imports.loc[valid_inner, '_basic_remainder'] = np.mod(
+        strict_imports.loc[valid_inner, 'import'],
+        strict_imports.loc[valid_inner, 'inner_bar']
+    )
+    strict_imports['_has_basic_bar'] = (
+        strict_imports['_basic_remainder'].abs() > FLOAT_TOLERANCE
+    )
+
+    bar_structure = (
+        strict_imports
+        .groupby(bar_group_cols, as_index=False)
+        .agg(
+            inner_bar=('inner_bar', 'first'),
+            basic_bar=('_has_basic_bar', 'max'),
+        )
+    )
+    bar_structure['basic_bar'] = bar_structure['basic_bar'].astype(int)
+
+    df = df.merge(bar_structure, on=bar_group_cols, how='left')
+else:
+    df['inner_bar'] = np.nan
+    df['basic_bar'] = 0
+
+df['basic_bar'] = df['basic_bar'].fillna(0).astype(int)
+df_imp = df[df['is_valid_import_bill'] & (df['import'] > 0)].copy()
 
 df['Expected_Import'] = np.nan
 df['Diff_Import'] = np.nan
@@ -130,7 +197,7 @@ if not df_imp.empty:
     )
 
     df_imp['is_outlier_import'] = (
-        (df_imp['ZScore_Import'] > 2.5)
+        (df_imp['ZScore_Import'] > OUTLIER_Z_THRESHOLD)
         & ((df_imp['import'] - df_imp['_median_import']) >= 5)
     )
 
@@ -148,11 +215,13 @@ if not df_imp.empty:
 # ============================================================
 df['_ewma_expected'] = np.nan
 valid_mask = df['import'] > 0
-valid_df = df.loc[valid_mask, ['product_id', 'import']].copy()
+valid_df = df.loc[valid_mask, ['product_id', 'unit', 'import']].copy()
 
 if not valid_df.empty:
     # นับจำนวนบิลต่อ SKU
-    valid_counts = valid_df.groupby('product_id')['import'].transform('count')
+    valid_counts = (
+        valid_df.groupby(['product_id', 'unit'])['import'].transform('count')
+    )
     
     # คำนวณ dynamic_span (3 ถึง 10)
     valid_df['dynamic_span'] = np.clip(valid_counts // 2, 3, 10)
@@ -164,8 +233,10 @@ if not valid_df.empty:
         if span_subset.empty:
             continue
             
-        span_ewma = span_subset.groupby('product_id')['import'].ewm(span=span_val, min_periods=1).mean()
-        span_ewma = span_ewma.reset_index(level=0, drop=True)
+        span_ewma = span_subset.groupby(
+            ['product_id', 'unit']
+        )['import'].ewm(span=span_val, min_periods=1).mean()
+        span_ewma = span_ewma.reset_index(level=[0, 1], drop=True)
         ewma_results.append(span_ewma)
         
     if ewma_results:
@@ -173,14 +244,30 @@ if not valid_df.empty:
         df.loc[all_ewma.index, '_ewma_expected'] = all_ewma
 
 # กระจายค่า prediction ไปยังแถวอื่นใน SKU เดียวกันด้วย forward-fill + back-fill
-df['_ewma_expected'] = df.groupby('product_id')['_ewma_expected'].ffill().bfill()
+df['_ewma_expected'] = (
+    df.groupby(['product_id', 'unit'])['_ewma_expected'].ffill().bfill()
+)
 
 # Expected_Import เบื้องต้น: ถ้ามี import > 0 ใช้ EWMA prediction
 # ถ้า import == 0 ใส่ NaN (ไม่ใช่ anomaly ส่วนนี้)
-df['Expected_Import'] = np.where(
+df['EWMA_Expected_Import'] = np.where(
     df['import'] > 0,
     df['_ewma_expected'],
     np.nan
+)
+ewma_mask = (df['import'] > 0) & df['EWMA_Expected_Import'].notna()
+df.loc[ewma_mask, 'EWMA_Expected_Import'] = _round_positive_qty_series(
+    df.loc[ewma_mask, 'EWMA_Expected_Import']
+)
+
+df['Expected_Import'] = np.where(
+    df['import'] > 0,
+    df['import'],
+    np.nan
+)
+expected_mask = (df['import'] > 0) & df['Expected_Import'].notna()
+df.loc[expected_mask, 'Expected_Import'] = _round_positive_qty_series(
+    df.loc[expected_mask, 'Expected_Import']
 )
 
 df['Diff_Import'] = np.where(
@@ -235,9 +322,16 @@ df['export_date_temp'] = df['DATE'].where(df['export'] > 0)
 df['last_export_date'] = (
     df.groupby('product_id')['export_date_temp'].ffill()
 )
-df['days_idle'] = (
-    df['DATE'] - df['last_export_date']
-).dt.days.fillna(0)
+
+# ปรับปรุงตามคำแนะนำ: ถ้ารายการเป็นบรรทัดสุดท้ายของสินค้า ให้เทียบกับวันที่ล่าสุดในข้อมูลทั้งหมด (max_global_date)
+max_global_date = df['DATE'].max()
+is_last_row_per_sku = ~df.duplicated(subset=['product_id'], keep='last')
+
+df['days_idle'] = np.where(
+    is_last_row_per_sku,
+    (max_global_date - df['last_export_date']).dt.days.fillna(0),
+    (df['DATE'] - df['last_export_date']).dt.days.fillna(0)
+)
 df.drop(columns=['export_date_temp'], inplace=True)
 
 # หาระยะเวลาจนกว่าจะขายครั้งถัดไป (Dynamic based on each SKU's timeline)
@@ -246,9 +340,9 @@ df['next_export_date'] = df.groupby('product_id')['export_date_temp_bfill'].bfil
 df['days_to_next_export'] = (df['next_export_date'] - df['DATE']).dt.days.fillna(np.inf)
 df.drop(columns=['export_date_temp_bfill'], inplace=True)
 
-# Ghost Stock
+# Ghost Stock (สเปค: > 2× normal cycle)
 df['dynamic_idle_threshold_c1'] = np.ceil(
-    df['median_inter_sale_days'] * 1.5
+    df['median_inter_sale_days'] * NORMAL_CYCLE_MULTIPLIER
 )
 
 df['is_suspected_ghost'] = (
@@ -258,9 +352,9 @@ df['is_suspected_ghost'] = (
     & (df['days_to_next_export'] <= df['dynamic_idle_threshold_c1'])  # ขายออกภายใน Threshold ตัวเอง
 )
 
-# Dead Stock
+# Dead Stock (สเปค: > 2× normal cycle)
 df['dynamic_idle_threshold_c2'] = np.ceil(
-    df['median_inter_sale_days'] * 1.8
+    df['median_inter_sale_days'] * NORMAL_CYCLE_MULTIPLIER
 )
 
 df['is_dead_last_item'] = (
@@ -436,11 +530,23 @@ zero_stock_reverse_mask = (
 )
 
 # Reverse Reconciliation: คำนวณเฉพาะแถวที่เป็น Outlier
-# ถ้ายอดรับเข้ามากกว่าสต็อกปลายทาง → มีส่วนเกินที่น่าสงสัย
+# เพิ่มเงื่อนไข: ถ้าตอนจบ SKU นิ่งไปแล้ว (Stagnant) และเราหาเจอ max import bill 
+# ให้ลองแก้บิลนั้นให้สต็อกปลายทางกลายเป็น 0 พอดี
+df['is_last_row_per_sku_reverse'] = ~df.duplicated(subset=['product_id'], keep='last')
+df['is_stagnant_last_row'] = (
+    df['is_last_row_per_sku_reverse'] 
+    & (df['days_idle'] > df['dynamic_idle_threshold_c2'])
+    & (df['balances'] > 0)
+)
+df['sku_has_stagnant_end'] = df.groupby('product_id')['is_stagnant_last_row'].transform('max')
+df['is_max_import'] = df['import'] == df.groupby('product_id')['import'].transform('max')
+
 period_end_reverse_mask = (
-    (df['is_outlier_import'] == True)
+    (df['is_outlier_import'] | (df['sku_has_stagnant_end'] & df['is_max_import']))
+    & (df['import'] > 0)
     & (df['import'] > df['period_end_balance'])
     & df['inferred_import'].notna()
+    & (df['inferred_import'] >= 0)
     & (df['inferred_import'] < df['import'])
 )
 
@@ -926,6 +1032,19 @@ def build_candidate_matrix(
             ewma_prediction
         )
 
+    # Split-Bill / Missing-Entry Re-check
+    # สเปค: ถ้ายอด anomaly (เช่น 6) แบ่งเป็นส่วนเท่าๆ กัน (เช่น 3+3)
+    # แล้วค่าที่ได้ผ่าน outlier test → flag เป็น combined/missing-entry
+    for n_splits in (2, 3, 4):
+        if observed_import % n_splits == 0:
+            split_qty = observed_import // n_splits
+            if split_qty > 0:
+                add(
+                    f'Split-Bill: {n_splits} bills combined',
+                    f'{observed_import} / {n_splits}',
+                    split_qty
+                )
+
     return candidates
 
 
@@ -1338,6 +1457,11 @@ def diagnose_row(row, product_history):
             result['Diag_Root_Cause'] = (
                 '🟢 Reconciliation Match: '
                 'คำนวณย้อนกลับพบยอดที่ทำให้สต็อกเหลือ 0 พอดี และสอดคล้องกับโครงสร้างบาร์'
+            )
+        elif 'Split-Bill' in best['hypothesis']:
+            result['Diag_Root_Cause'] = (
+                '🟠 Split-Bill / Missing-Entry: '
+                'ยอดรับเข้าอาจเป็นหลายบิลรวมกัน หรือลืมคีย์บิลแยกชิ้น'
             )
         else:
             result['Diag_Root_Cause'] = (
